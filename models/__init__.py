@@ -1,5 +1,5 @@
-from .user import User
+# models/__init__.py
+from .team_member import TeamMember
 from .task import Task
-from .team import Team
 
-__all__ = ['User', 'Task', 'Team']
+__all__ = ['TeamMember', 'Task']

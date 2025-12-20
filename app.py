@@ -1,9 +1,10 @@
 from flask import Flask, request, jsonify
-from pymongo import MongoClient
+import mysql.connector
 from dotenv import load_dotenv
 import os
 import logging
 from services.task_service import TaskService
+from services.reminder_service import ReminderService
 
 # Load environment variables
 load_dotenv()
@@ -15,81 +16,49 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database configuration
-def get_database():
-    client = MongoClient(os.getenv('MONGODB_URI', 'mongodb://31.97.230.38:27017/'))
-    return client['team_management']
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', '31.97.230.38'),
+    'port': int(os.getenv('DB_PORT', 4000)),
+    'user': os.getenv('DB_USER', 'mysqluser'),
+    'password': os.getenv('DB_PASSWORD', 'mysqlpassword'),
+    'database': os.getenv('DB_NAME', 'airbnb_db'),
+    'charset': 'utf8mb4'
+}
+
+def get_db_connection():
+    """Create and return MySQL database connection"""
+    try:
+        connection = mysql.connector.connect(**DB_CONFIG)
+        return connection
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        return None
 
 # Initialize services
-db = get_database()
-task_service = TaskService(db)
+task_service = TaskService(DB_CONFIG)
+reminder_service = ReminderService(DB_CONFIG)
 
-def initialize_sample_data():
-    """Initialize sample user and tasks for testing"""
-    from models.user import User
+def check_existing_data():
+    """Check what data already exists in the database"""
+    from models.team_member import TeamMember
     from models.task import Task
     
-    user_model = User(db)
-    task_model = Task(db)
+    team_member_model = TeamMember(DB_CONFIG)
+    task_model = Task(DB_CONFIG)
     
-    # Check if sample user exists
-    sample_user = user_model.find_by_phone('917667130178')
-    if not sample_user:
-        print("Creating sample user...")
-        user_id = user_model.create_user(
-            phone_number='917667130178',
-            name='Shiva',
-            role='member'
-        )
+    # Check if sample team member exists
+    sample_member = team_member_model.find_by_phone('7667130178')
+    if sample_member:
+        print(f"✅ Team member found: {sample_member['name']} (ID: {sample_member['id']})")
         
-        # Create sample tasks with property names
-        task_model.create_task(
-            title="Check shampoo bottles in bathroom",
-            description="Verify shampoo bottles are filled and replace if needed in master and guest bathrooms",
-            assigned_to=user_id,
-            assigned_by=user_id,
-            priority="medium",
-            property_name="Seaside Apartments"
-        )
+        # Check tasks for this member
+        tasks = task_model.get_tasks_by_user(sample_member['id'])
+        print(f"📋 Number of tasks assigned: {len(tasks)}")
         
-        task_model.create_task(
-            title="Deep clean kitchen.",
-            description="Clean kitchen countertops, sanitize sink, wipe down appliances, and mop floor",
-            assigned_to=user_id,
-            assigned_by=user_id,
-            priority="high",
-            property_name="Ocean View Villa"
-        )
-        
-        task_model.create_task(
-            title="Replace toilet paper.",
-            description="Check and refill toilet paper in all bathrooms, ensure backup rolls are available",
-            assigned_to=user_id,
-            assigned_by=user_id,
-            priority="low",
-            property_name="Mountain Lodge"
-        )
-        
-        task_model.create_task(
-            title="Vacuum living room carpet",
-            description="Vacuum all carpeted areas in living room and dining area, spot clean any stains",
-            assigned_to=user_id,
-            assigned_by=user_id,
-            priority="medium",
-            property_name="Beachfront Cottage"
-        )
-        
-        task_model.create_task(
-            title="Check coffee supplies in kitchen",
-            description="Ensure coffee pods, filters, and sugar packets are stocked for guest arrival",
-            assigned_to=user_id,
-            assigned_by=user_id,
-            priority="low",
-            property_name="City Center Loft"
-        )
-        
-        print("✅ Sample data created successfully!")
+        for task in tasks:
+            print(f"  - {task['title']} (Status: {task['status']})")
     else:
-        print("✅ Sample user already exists")
+        print("❌ Team member not found")
 
 @app.route('/')
 def home():
@@ -138,25 +107,70 @@ def verify_webhook():
 @app.route('/debug', methods=['GET'])
 def debug_info():
     """Debug endpoint to check application status"""
-    from models.user import User
-    user_model = User(db)
+    from models.team_member import TeamMember
+    team_member_model = TeamMember(DB_CONFIG)
     
-    user = user_model.find_by_phone('917667130178')
+    member = team_member_model.find_by_phone('7667130178')
     
     return jsonify({
         "status": "running",
-        "user_exists": bool(user),
-        "user_details": {
-            "name": user.get('name') if user else None,
-            "phone": user.get('phone_number') if user else None
-        } if user else None
+        "member_exists": bool(member),
+        "member_details": member if member else None,
+        "database_connected": bool(get_db_connection())
     })
+@app.route('/send-test-reminder/<int:task_id>', methods=['POST'])
+def send_test_reminder(task_id):
+    """Endpoint to test reminder for a specific task"""
+    try:
+        success = reminder_service.send_immediate_reminder(task_id)
+        if success:
+            return jsonify({"status": "success", "message": "Test reminder sent"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to send test reminder"}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500    
+
+@app.route('/test-whatsapp/<phone_number>', methods=['POST'])
+def test_whatsapp(phone_number):
+    """Test endpoint to send a WhatsApp message"""
+    try:
+        from services.whatsapp_service import WhatsAppService
+        whatsapp_service = WhatsAppService()
+        
+        test_message = "🔔 Test message from your Team Management Bot\n\nThis is a test to verify WhatsApp messaging is working."
+        
+        success = whatsapp_service.send_message(phone_number, test_message, 'en')
+        
+        if success:
+            return jsonify({
+                "status": "success", 
+                "message": f"Test message sent to {phone_number}",
+                "cleaned_number": phone_number
+            })
+        else:
+            return jsonify({
+                "status": "error", 
+                "message": f"Failed to send test message to {phone_number}"
+            }), 400
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    # Initialize sample data
-    initialize_sample_data()
+    # Check existing data instead of creating sample data
+    print("🔍 Checking existing data...")
+    check_existing_data()
+    
+    # Start the reminder scheduler
+    print("🔔 Starting reminder scheduler...")
+    reminder_service.start_reminder_scheduler()
     
     # Run the application
     port = int(os.getenv('PORT', 7000))
     logger.info(f"Starting Flask app on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=True)
+    
+    try:
+        app.run(host='0.0.0.0', port=port, debug=True)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down...")
+        reminder_service.stop_reminder_scheduler()
