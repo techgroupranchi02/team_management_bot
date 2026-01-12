@@ -21,8 +21,10 @@ DB_CONFIG = {
     'port': int(os.getenv('DB_PORT', 4000)),
     'user': os.getenv('DB_USER', 'mysqluser'),
     'password': os.getenv('DB_PASSWORD', 'mysqlpassword'),
-    'database': os.getenv('DB_NAME', 'airbnb_db'),
-    'charset': 'utf8mb4'
+    'database': os.getenv('DB_NAME', 'airbnb_db_copy'),
+    'charset': 'utf8mb4',
+    'buffered': True,  # Add this line
+    'autocommit': True 
 }
 
 def get_db_connection():

@@ -37,12 +37,15 @@ class Task:
         
         try:
             query = """
-                SELECT t.*, p.name as property_name, tm.name as assigned_to_name
+                SELECT t.*, p.name as property_name, tm.name as assigned_to_name,
+                       COALESCE(t.scheduled_date, rtm.start_date) as display_date
                 FROM tasks t
+                LEFT JOIN recurring_task_manifest rtm ON t.recurring_task_id = rtm.id
                 LEFT JOIN properties p ON t.property_id = p.id
                 LEFT JOIN team_members tm ON t.assigned_to = tm.id
                 WHERE t.assigned_to = %s
-                ORDER BY t.created_at DESC
+                AND t.status != 'deleted'
+                ORDER BY COALESCE(t.scheduled_date, rtm.start_date) DESC
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
@@ -55,6 +58,10 @@ class Task:
                     task['updated_at'] = task['updated_at'].isoformat()
                 if task.get('completed_at'):
                     task['completed_at'] = task['completed_at'].isoformat()
+                if task.get('scheduled_date'):
+                    task['scheduled_date'] = task['scheduled_date'].isoformat()
+                if task.get('display_date'):
+                    task['display_date'] = task['display_date'].isoformat()
             
             return tasks
         finally:
@@ -89,8 +96,6 @@ class Task:
             
             if status == "completed":
                 update_data["completed_at"] = datetime.now()
-                # Don't clear completion image when marking as completed
-                # Only update completion_image if it's being set
             
             set_clause = ", ".join([f"{key} = %s" for key in update_data.keys()])
             values = list(update_data.values()) + [task_id, user_id]
@@ -205,14 +210,16 @@ class Task:
         
         try:
             query = """
-                SELECT t.*, p.name as property_name
+                SELECT t.*, p.name as property_name,
+                       COALESCE(t.scheduled_date, rtm.start_date) as display_date
                 FROM tasks t
+                LEFT JOIN recurring_task_manifest rtm ON t.recurring_task_id = rtm.id
                 LEFT JOIN properties p ON t.property_id = p.id
                 WHERE t.assigned_to = %s 
-                AND t.status = 'completed'
                 AND t.is_photo_required = 1
                 AND (t.completion_image IS NULL OR t.completion_image = '')
-                ORDER BY t.completed_at DESC
+                AND t.status IN ('pending', 'in_progress', 'completed')
+                ORDER BY COALESCE(t.scheduled_date, rtm.start_date) DESC
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
@@ -222,6 +229,10 @@ class Task:
                     task['completed_at'] = task['completed_at'].isoformat()
                 if task.get('created_at'):
                     task['created_at'] = task['created_at'].isoformat()
+                if task.get('scheduled_date'):
+                    task['scheduled_date'] = task['scheduled_date'].isoformat()
+                if task.get('display_date'):
+                    task['display_date'] = task['display_date'].isoformat()
             
             return tasks
         finally:
@@ -258,28 +269,64 @@ class Task:
             conn.close()
 
     def get_recurring_tasks_due_for_reminder(self):
-        """Get recurring tasks that are due for reminders based on their recurrence pattern"""
+        """Get recurring tasks that are due for reminders based on their schedule_type pattern"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
         
         try:
             query = """
                 SELECT 
-                    t.*,
+                    rtm.*,
                     tm.phone,
                     tm.name as team_member_name,
+                    rtm.schedule_type,
+                    DATE(rtm.start_date) as start_date_only,
                     tr.reminder_sent_at,
                     tr.next_reminder_date
-                FROM tasks t
-                JOIN team_members tm ON t.assigned_to = tm.id
-                LEFT JOIN task_reminders tr ON t.id = tr.task_id AND t.assigned_to = tr.team_member_id
-                WHERE t.schedule_type = 'recurring'
-                AND t.recurrence IN ('daily', 'weekly', 'monthly', 'quarterly', 'yearly')
-                AND t.status IN ('pending', 'in_progress')
+                FROM recurring_task_manifest rtm
+                JOIN team_members tm ON rtm.assigned_to = tm.id
+                LEFT JOIN task_reminders tr ON rtm.id = tr.task_id AND rtm.assigned_to = tr.team_member_id
+                WHERE rtm.schedule_type IN ('daily', 'weekly', 'monthly', 'quarterly', 'yearly')
+                AND rtm.status = 'active'
+                AND rtm.assigned_to IS NOT NULL
+                AND tm.phone IS NOT NULL
+                AND tm.phone != ''
                 AND (
-                    tr.next_reminder_date IS NULL 
-                    OR tr.next_reminder_date <= CURDATE()
+                    -- Tasks that start today or in the past
+                    rtm.start_date <= CURDATE()
+                    AND (
+                        -- For daily tasks: always due
+                        rtm.schedule_type = 'daily'
+                        OR
+                        -- For weekly tasks: check if today matches the repeat_on day
+                        (rtm.schedule_type = 'weekly' 
+                         AND (rtm.repeat_on IS NULL 
+                              OR JSON_EXTRACT(rtm.repeat_on, '$.day_of_week') IS NULL
+                              OR JSON_EXTRACT(rtm.repeat_on, '$.day_of_week') = DAYOFWEEK(CURDATE())))
+                        OR
+                        -- For monthly tasks: check if today matches the repeat_on day of month
+                        (rtm.schedule_type = 'monthly'
+                         AND (rtm.repeat_on IS NULL 
+                              OR JSON_EXTRACT(rtm.repeat_on, '$.day_of_month') IS NULL
+                              OR JSON_EXTRACT(rtm.repeat_on, '$.day_of_month') = DAY(CURDATE())))
+                        OR
+                        -- For quarterly tasks (simplified: every 3 months from start date)
+                        (rtm.schedule_type = 'quarterly' 
+                         AND MOD(MONTH(CURDATE()) - MONTH(rtm.start_date), 3) = 0 
+                         AND DAY(CURDATE()) = DAY(rtm.start_date))
+                        OR
+                        -- For yearly tasks: same month and day as start date
+                        (rtm.schedule_type = 'yearly' 
+                         AND MONTH(CURDATE()) = MONTH(rtm.start_date) 
+                         AND DAY(CURDATE()) = DAY(rtm.start_date))
+                    )
+                )
+                AND (
+                    -- Check if reminder hasn't been sent yet or it's time for next reminder
+                    tr.id IS NULL
                     OR tr.reminder_sent_at IS NULL
+                    OR tr.next_reminder_date IS NULL
+                    OR tr.next_reminder_date <= CURDATE()
                     OR DATE(tr.reminder_sent_at) < CURDATE()
                 )
             """
@@ -294,10 +341,14 @@ class Task:
                     task['updated_at'] = task['updated_at'].isoformat()
                 if task.get('completed_at'):
                     task['completed_at'] = task['completed_at'].isoformat()
+                if task.get('start_date'):
+                    task['start_date'] = task['start_date'].isoformat()
                 if task.get('reminder_sent_at'):
                     task['reminder_sent_at'] = task['reminder_sent_at'].isoformat()
                 if task.get('next_reminder_date'):
                     task['next_reminder_date'] = task['next_reminder_date'].isoformat()
+                # Add recurrence field for compatibility with existing code
+                task['recurrence'] = task.get('schedule_type', 'one_time')
             
             return tasks
         finally:
@@ -305,23 +356,23 @@ class Task:
             conn.close()
 
     def update_task_reminder(self, task_id, team_member_id):
-        """Update reminder tracking for a task"""
+        """Update reminder tracking for a recurring task manifest"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
         
         try:
-            # Get task recurrence pattern
-            query = "SELECT recurrence FROM tasks WHERE id = %s"
+            # Get task schedule_type from recurring_task_manifest
+            query = "SELECT schedule_type FROM recurring_task_manifest WHERE id = %s"
             cursor.execute(query, (task_id,))
             task = cursor.fetchone()
             
             if not task:
                 return False
             
-            recurrence = task['recurrence']
-            next_reminder_date = self._calculate_next_reminder_date(recurrence)
+            schedule_type = task['schedule_type']
+            next_reminder_date = self._calculate_next_reminder_date(schedule_type)
             
-            # Insert or update reminder record
+            # Insert or update reminder record in task_reminders table
             upsert_query = """
                 INSERT INTO task_reminders (task_id, team_member_id, reminder_sent_at, next_reminder_date)
                 VALUES (%s, %s, %s, %s)
@@ -331,6 +382,8 @@ class Task:
             """
             cursor.execute(upsert_query, (task_id, team_member_id, datetime.now(), next_reminder_date))
             conn.commit()
+            
+            print(f"✅ Reminder tracking updated for task {task_id}")
             return True
             
         except Exception as e:
@@ -377,13 +430,15 @@ class Task:
         
         try:
             query = """
-                SELECT t.*, p.name as property_name
-                FROM tasks t
-                LEFT JOIN properties p ON t.property_id = p.id
-                WHERE t.assigned_to = %s
-                AND t.schedule_type = 'recurring'
-                AND t.recurrence IN ('daily', 'weekly', 'monthly', 'quarterly', 'yearly')
-                ORDER BY t.created_at DESC
+                SELECT rtm.*, p.name as property_name,
+                       COALESCE(rtm.schedule_type, 'one_time') as recurrence,
+                       rtm.status as recurring_status
+                FROM recurring_task_manifest rtm
+                LEFT JOIN properties p ON rtm.property_id = p.id
+                WHERE rtm.assigned_to = %s
+                AND rtm.status = 'active'
+                AND rtm.schedule_type != 'one_time'
+                ORDER BY rtm.start_date DESC
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
@@ -395,8 +450,12 @@ class Task:
                     task['updated_at'] = task['updated_at'].isoformat()
                 if task.get('completed_at'):
                     task['completed_at'] = task['completed_at'].isoformat()
+                if task.get('start_date'):
+                    task['start_date'] = task['start_date'].isoformat()
+                # Store recurrence from schedule_type
+                task['recurrence'] = task.get('schedule_type', 'one_time')
             
             return tasks
         finally:
             cursor.close()
-            conn.close()        
+            conn.close()
