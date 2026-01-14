@@ -3,6 +3,7 @@ import mysql.connector
 from dotenv import load_dotenv
 import os
 import logging
+import json 
 from services.task_service import TaskService
 from services.reminder_service import ReminderService
 
@@ -69,42 +70,98 @@ def home():
 @app.route('/whatsapp/webhook', methods=['POST'])
 def whatsapp_webhook():
     try:
+        # Meta sends JSON data, not form data
+        data = request.get_json()
+        
         # Log all incoming data for debugging
-        logger.info(f"Incoming request form data: {dict(request.form)}")
+        logger.info(f"Incoming Meta webhook data: {json.dumps(data, indent=2) if data else 'No data'}")
         
-        # Get incoming message data
-        incoming_msg = request.form.get('Body', '').strip()
-        from_number = request.form.get('From', '')
-        media_url = request.form.get('MediaUrl0')
-        media_content_type = request.form.get('MediaContentType0', '')
+        if not data or 'entry' not in data:
+            logger.info("No valid message data in webhook")
+            return '', 200
         
-        logger.info(f"Received from {from_number}: {incoming_msg}")
-        if media_url:
-            logger.info(f"Media detected: {media_url} (Type: {media_content_type})")
-        
-        # Check if message contains media
-        if media_url and media_content_type.startswith('image/'):
-            logger.info("Processing image upload...")
-            task_service.handle_message(from_number, "", media_url)
-        elif incoming_msg.lower().startswith('join'):
-            # Handle join command separately
-            logger.info(f"Join command received: {incoming_msg}")
-        else:
-            # Process text message
-            task_service.handle_message(from_number, incoming_msg, None)
+        # Process each entry
+        for entry in data['entry']:
+            for change in entry.get('changes', []):
+                if change.get('field') == 'messages':
+                    value = change.get('value', {})
+                    
+                    # Extract contacts and messages
+                    contacts = value.get('contacts', [])
+                    messages = value.get('messages', [])
+                    
+                    if messages:
+                        message = messages[0]
+                        message_type = message.get('type')
+                        from_number = message.get('from', '')
+                        
+                        # Get contact name if available
+                        contact_name = contacts[0].get('profile', {}).get('name', '') if contacts else ''
+                        
+                        logger.info(f"📨 Message type: {message_type} from: {from_number} (Contact: {contact_name})")
+                        
+                        if message_type == 'text':
+                            incoming_msg = message.get('text', {}).get('body', '').strip()
+                            logger.info(f"📝 Text message: {incoming_msg}")
+                            
+                            if incoming_msg.lower().startswith('join'):
+                                logger.info(f"Join command received: {incoming_msg}")
+                            else:
+                                # Process text message
+                                task_service.handle_message(f"whatsapp:{from_number}", incoming_msg, None)
+                        
+                        elif message_type == 'image':
+                            # Get image information
+                            image_data = message.get('image', {})
+                            media_id = image_data.get('id', '')
+                            caption = image_data.get('caption', '')
+                            
+                            logger.info(f"🖼️ Image message, Media ID: {media_id}, Caption: {caption}")
+                            
+                            # Process image upload with caption (if any)
+                            task_service.handle_message(f"whatsapp:{from_number}", caption or "", media_id)
+                        
+                        elif message_type == 'interactive':
+                            # Handle button clicks
+                            interactive_data = message.get('interactive', {})
+                            button_reply = interactive_data.get('button_reply', {})
+                            list_reply = interactive_data.get('list_reply', {})
+                            
+                            if button_reply:
+                                button_id = button_reply.get('id', '')
+                                title = button_reply.get('title', '')
+                                logger.info(f"🔄 Button click: {button_id} - {title}")
+                                # You can handle button actions here
+                                task_service.handle_message(f"whatsapp:{from_number}", title, None)
+                        
+                        else:
+                            logger.info(f"⚠️ Unhandled message type: {message_type}")
         
         return '', 200
 
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
+        logger.error(f"Request data: {request.data}")
         return '', 500
 
 @app.route('/whatsapp/webhook', methods=['GET'])
 def verify_webhook():
-    """Verify webhook for Twilio"""
-    challenge = request.args.get('hub.challenge', '')
-    logger.info(f"Webhook verification challenge: {challenge}")
-    return challenge, 200
+    """Verify webhook for Facebook/Meta WhatsApp Business API"""
+    mode = request.args.get('hub.mode')
+    token = request.args.get('hub.verify_token')
+    challenge = request.args.get('hub.challenge')
+    
+    # Your verify token (should match what you set in Meta Developer Portal)
+    verify_token = os.getenv('META_VERIFY_TOKEN', 'your-verify-token')
+    
+    logger.info(f"Webhook verification attempt - Mode: {mode}, Token: {token}")
+    
+    if mode == 'subscribe' and token == verify_token:
+        logger.info("✅ Webhook verified successfully")
+        return challenge, 200
+    else:
+        logger.error("❌ Webhook verification failed")
+        return jsonify({"error": "Verification failed"}), 403
 
 @app.route('/debug', methods=['GET'])
 def debug_info():

@@ -71,6 +71,7 @@ class TeamMember:
     def get_possible_phone_formats(self, phone_number):
         """Generate all possible phone number formats to try"""
         if not phone_number:
+            print("❌ No phone number provided")
             return []
         
         # Remove whatsapp: prefix
@@ -81,25 +82,30 @@ class TeamMember:
         
         possible_formats = []
         
-        # Original format from Twilio (with + and country code)
-        if phone_number:
-            possible_formats.append(phone_number.replace('whatsapp:', ''))
-        
-        # Digits only (exactly as received)
+        # Original format from Meta (with country code, no +)
         if digits_only:
             possible_formats.append(digits_only)
         
-        # Without country code (if it has country code)
+        # Try with + prefix
+        if digits_only:
+            possible_formats.append(f"+{digits_only}")
+        
+        # Remove country code for Indian numbers (91)
         if digits_only.startswith('91') and len(digits_only) > 10:
             possible_formats.append(digits_only[2:])  # Remove country code
         
-        # With country code (if it doesn't have it)
+        # Add country code if missing (for 10-digit numbers)
         if len(digits_only) == 10:
-            possible_formats.append('91' + digits_only)  # Add country code
+            possible_formats.append('91' + digits_only)  # Add Indian country code
         
-        # Also try without any country code (just the local number)
+        # Last 10 digits
         if len(digits_only) >= 10:
             possible_formats.append(digits_only[-10:])  # Last 10 digits
         
+        # Try with 0 prefix
+        if len(digits_only) == 10:
+            possible_formats.append('0' + digits_only)
+        
+        print(f"🔍 Phone lookup formats for '{phone_number}': {possible_formats}")
         # Remove duplicates and return
         return list(set([fmt for fmt in possible_formats if fmt]))

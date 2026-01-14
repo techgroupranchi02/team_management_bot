@@ -1,92 +1,99 @@
-from twilio.rest import Client
+import requests
 import os
 from dotenv import load_dotenv
 from services.language_service import LanguageService
 import logging
+import json
 
 load_dotenv()
 
 class WhatsAppService:
     def __init__(self):
-        self.account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-        self.auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-        self.whatsapp_number = os.getenv('TWILIO_WHATSAPP_NUMBER')
+        self.meta_access_token = os.getenv('META_ACCESS_TOKEN')
+        self.phone_number_id = os.getenv('META_PHONE_NUMBER_ID')
+        self.api_version = os.getenv('META_API_VERSION', 'v19.0')
+        self.graph_api_url = f"https://graph.facebook.com/{self.api_version}/{self.phone_number_id}/messages"
         
-        if not all([self.account_sid, self.auth_token, self.whatsapp_number]):
-            raise ValueError("Missing Twilio environment variables")
+        if not all([self.meta_access_token, self.phone_number_id]):
+            raise ValueError("Missing Meta environment variables")
             
-        self.client = Client(self.account_sid, self.auth_token)
         self.language_service = LanguageService()
         self.logger = logging.getLogger(__name__)
 
     def send_message(self, to, message, language='en'):
         try:
-            # Clean and validate phone number
-            clean_to = self._clean_phone_number(to)
+            # Clean and format phone number for Meta API
+            clean_to = self._clean_phone_number_for_meta(to)
+            
+            print(f"📤 Attempting to send to: {clean_to}, Original: {to}")
+            print(f"📤 Message: {message[:50]}...")
             
             if not self._is_valid_phone_number(clean_to):
                 self.logger.error(f"Invalid phone number format: {clean_to}")
                 return False
 
-            self.logger.info(f"Attempting to send WhatsApp message to: {clean_to}")
-            self.logger.info(f"From Twilio number: {self.whatsapp_number}")
-            self.logger.info(f"Message length: {len(message)}")
+            headers = {
+                'Authorization': f'Bearer {self.meta_access_token}',
+                'Content-Type': 'application/json'
+            }
             
-            # Send message
-            message_obj = self.client.messages.create(
-                body=message,
-                from_=f"whatsapp:{self.whatsapp_number}",
-                to=f"whatsapp:{clean_to}"
-            )
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": clean_to,
+                "type": "text",
+                "text": {
+                    "preview_url": False,
+                    "body": message
+                }
+            }
             
-            self.logger.info(f"✅ WhatsApp message sent successfully! SID: {message_obj.sid}")
-            self.logger.info(f"Message status: {message_obj.status}")
-            self.logger.info(f"Message price: {getattr(message_obj, 'price', 'N/A')}")
+            print(f"📤 Headers: {headers}")
+            print(f"📤 Payload: {json.dumps(payload, indent=2)}")
             
-            return True
+            response = requests.post(self.graph_api_url, headers=headers, json=payload)
             
-        except Exception as e:
-            self.logger.error(f"❌ Failed to send WhatsApp message: {str(e)}")
+            print(f"📤 Response Status: {response.status_code}")
+            print(f"📤 Response: {response.text}")
             
-            # More detailed error information
-            if hasattr(e, 'code'):
-                self.logger.error(f"Error code: {e.code}")
-            if hasattr(e, 'more_info'):
-                self.logger.error(f"More info: {e.more_info}")
+            if response.status_code == 200:
+                response_data = response.json()
+                message_id = response_data.get('messages', [{}])[0].get('id', 'N/A')
+                self.logger.info(f"✅ WhatsApp message sent successfully! Message ID: {message_id}")
+                return True
+            else:
+                self.logger.error(f"❌ Failed to send WhatsApp message. Status: {response.status_code}")
+                return False
                 
+        except Exception as e:
+            self.logger.error(f"❌ Error sending WhatsApp message: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
-    def _clean_phone_number(self, phone_number):
-        """Clean and format phone number"""
+    def _clean_phone_number_for_meta(self, phone_number):
+        """Clean and format phone number for Meta API"""
         # Remove 'whatsapp:' prefix if present
         clean_number = phone_number.replace('whatsapp:', '')
         
-        # Remove any non-digit characters except +
-        clean_number = ''.join(c for c in clean_number if c.isdigit() or c == '+')
+        # Remove all non-digit characters
+        clean_number = ''.join(c for c in clean_number if c.isdigit())
         
-        # If no country code, assume Indian number (+91)
-        if not clean_number.startswith('+'):
-            if clean_number.startswith('91') and len(clean_number) == 12:
-                clean_number = '+' + clean_number
-            elif len(clean_number) == 10:  # Indian number without country code
-                clean_number = '+91' + clean_number
-            elif len(clean_number) == 12 and clean_number.startswith('91'):
-                clean_number = '+' + clean_number
-        
+        # Meta requires the phone number with country code but without + prefix
+        # Example: 917667130178 (India: 91 + 7667130178)
         return clean_number
 
     def _is_valid_phone_number(self, phone_number):
-        """Basic phone number validation"""
-        if not phone_number.startswith('+'):
+        """Basic phone number validation for Meta API"""
+        if not phone_number:
             return False
         
-        # Remove + and check if remaining are digits
-        digits = phone_number[1:]
-        if not digits.isdigit():
+        # Check if all digits
+        if not phone_number.isdigit():
             return False
             
-        # Check minimum length (country code + number)
-        if len(digits) < 10:
+        # Check minimum length (should have country code + number)
+        if len(phone_number) < 10:
             return False
             
         return True

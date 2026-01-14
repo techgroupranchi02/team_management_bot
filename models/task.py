@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 import mysql.connector
+import json
+
 
 class Task:
     def __init__(self, db_config):
@@ -8,12 +10,12 @@ class Task:
     def get_connection(self):
         return mysql.connector.connect(**self.db_config)
 
-    def create_task(self, client_id, title, description, assigned_to, task_type="other", 
-                   property_id=None, inventory_id=None, schedule_type="one_time", 
-                   recurrence=None, is_photo_required=False):
+    def create_task(self, client_id, title, description, assigned_to, task_type="other",
+                    property_id=None, inventory_id=None, schedule_type="one_time",
+                    recurrence=None, is_photo_required=False):
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
                 INSERT INTO tasks 
@@ -22,8 +24,8 @@ class Task:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
             """
             values = (client_id, title, description, task_type, property_id, inventory_id,
-                     assigned_to, schedule_type, recurrence, is_photo_required)
-            
+                      assigned_to, schedule_type, recurrence, is_photo_required)
+
             cursor.execute(query, values)
             conn.commit()
             return cursor.lastrowid
@@ -34,7 +36,7 @@ class Task:
     def get_tasks_by_user(self, user_id):
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
                 SELECT t.*, p.name as property_name, tm.name as assigned_to_name,
@@ -49,7 +51,7 @@ class Task:
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
-            
+
             # Convert datetime objects to strings for JSON serialization
             for task in tasks:
                 if task.get('created_at'):
@@ -62,7 +64,7 @@ class Task:
                     task['scheduled_date'] = task['scheduled_date'].isoformat()
                 if task.get('display_date'):
                     task['display_date'] = task['display_date'].isoformat()
-            
+
             return tasks
         finally:
             cursor.close()
@@ -72,7 +74,7 @@ class Task:
         """Get specific task by ID with optional user validation"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             if user_id:
                 query = "SELECT * FROM tasks WHERE id = %s AND assigned_to = %s"
@@ -80,7 +82,7 @@ class Task:
             else:
                 query = "SELECT * FROM tasks WHERE id = %s"
                 cursor.execute(query, (task_id,))
-            
+
             task = cursor.fetchone()
             return task
         finally:
@@ -90,16 +92,17 @@ class Task:
     def update_task_status(self, task_id, status, user_id):
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         try:
             update_data = {"status": status}
-            
+
             if status == "completed":
                 update_data["completed_at"] = datetime.now()
-            
-            set_clause = ", ".join([f"{key} = %s" for key in update_data.keys()])
+
+            set_clause = ", ".join(
+                [f"{key} = %s" for key in update_data.keys()])
             values = list(update_data.values()) + [task_id, user_id]
-            
+
             query = f"UPDATE tasks SET {set_clause} WHERE id = %s AND assigned_to = %s"
             cursor.execute(query, values)
             conn.commit()
@@ -112,61 +115,63 @@ class Task:
         """Check if task can be completed (photo requirement check)"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
-                SELECT is_photo_required, completion_image 
+                SELECT is_photo_required, completion_images 
                 FROM tasks 
                 WHERE id = %s AND assigned_to = %s
             """
             cursor.execute(query, (task_id, user_id))
             task = cursor.fetchone()
-            
+
             if not task:
                 return False, "Task not found"
-            
+
             # If photo is required but no image is uploaded yet
-            if task['is_photo_required'] == 1 and not task['completion_image']:
+            if task['is_photo_required'] == 1 and not task['completion_images']:
                 return False, "photo_required"
-            
+
             return True, "Task can be completed"
-            
+
         finally:
             cursor.close()
             conn.close()
 
-    def add_completion_image(self, task_id, image_url, user_id):
+    def add_completion_images(self, task_id, image_url, user_id):
         """Add completion image URL to task and update status if needed"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             # First, get current task status and photo requirement
             query = "SELECT status, is_photo_required FROM tasks WHERE id = %s AND assigned_to = %s"
             cursor.execute(query, (task_id, user_id))
             task = cursor.fetchone()
-            
+
             if not task:
                 return False, "Task not found"
-            
+
             # Update the image
             update_query = """
                 UPDATE tasks 
-                SET completion_image = %s, image_added_at = %s 
+                SET completion_images = %s, image_added_at = %s 
                 WHERE id = %s AND assigned_to = %s
             """
-            cursor.execute(update_query, (image_url, datetime.now(), task_id, user_id))
-            
+            cursor.execute(
+                update_query, (image_url, datetime.now(), task_id, user_id))
+
             # If task was waiting for photo and now has one, auto-complete it
             if task['status'] != 'completed' and task['is_photo_required'] == 1:
                 status_query = "UPDATE tasks SET status = 'completed', completed_at = %s WHERE id = %s AND assigned_to = %s"
-                cursor.execute(status_query, (datetime.now(), task_id, user_id))
+                cursor.execute(
+                    status_query, (datetime.now(), task_id, user_id))
                 conn.commit()
                 return True, "completed"
-            
+
             conn.commit()
             return True, "image_added"
-            
+
         except Exception as e:
             conn.rollback()
             return False, str(e)
@@ -178,7 +183,7 @@ class Task:
         """Get most recently completed task without completion image"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
                 SELECT t.*, p.name as property_name
@@ -186,18 +191,18 @@ class Task:
                 LEFT JOIN properties p ON t.property_id = p.id
                 WHERE t.assigned_to = %s 
                 AND t.status = 'completed' 
-                AND (t.completion_image IS NULL OR t.completion_image = '')
+                AND (t.completion_images IS NULL OR t.completion_images = '')
                 ORDER BY t.completed_at DESC 
                 LIMIT 1
             """
             cursor.execute(query, (user_id,))
             task = cursor.fetchone()
-            
+
             if task and task.get('completed_at'):
                 task['completed_at'] = task['completed_at'].isoformat()
             if task and task.get('created_at'):
                 task['created_at'] = task['created_at'].isoformat()
-            
+
             return task
         finally:
             cursor.close()
@@ -207,7 +212,7 @@ class Task:
         """Get tasks that are marked as completed but waiting for photos"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
                 SELECT t.*, p.name as property_name,
@@ -217,13 +222,13 @@ class Task:
                 LEFT JOIN properties p ON t.property_id = p.id
                 WHERE t.assigned_to = %s 
                 AND t.is_photo_required = 1
-                AND (t.completion_image IS NULL OR t.completion_image = '')
+                AND (t.completion_images IS NULL OR t.completion_images = '')
                 AND t.status IN ('pending', 'in_progress', 'completed')
                 ORDER BY COALESCE(t.scheduled_date, rtm.start_date) DESC
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
-            
+
             for task in tasks:
                 if task.get('completed_at'):
                     task['completed_at'] = task['completed_at'].isoformat()
@@ -233,7 +238,7 @@ class Task:
                     task['scheduled_date'] = task['scheduled_date'].isoformat()
                 if task.get('display_date'):
                     task['display_date'] = task['display_date'].isoformat()
-            
+
             return tasks
         finally:
             cursor.close()
@@ -243,26 +248,26 @@ class Task:
         """Get tasks that have completion images"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
                 SELECT t.*, p.name as property_name
                 FROM tasks t
                 LEFT JOIN properties p ON t.property_id = p.id
                 WHERE t.assigned_to = %s 
-                AND t.completion_image IS NOT NULL 
-                AND t.completion_image != ''
+                AND t.completion_images IS NOT NULL 
+                AND t.completion_images != ''
                 ORDER BY t.completed_at DESC
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
-            
+
             for task in tasks:
                 if task.get('completed_at'):
                     task['completed_at'] = task['completed_at'].isoformat()
                 if task.get('created_at'):
                     task['created_at'] = task['created_at'].isoformat()
-            
+
             return tasks
         finally:
             cursor.close()
@@ -272,7 +277,7 @@ class Task:
         """Get recurring tasks that are due for reminders based on their schedule_type pattern"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
                 SELECT 
@@ -332,7 +337,7 @@ class Task:
             """
             cursor.execute(query)
             tasks = cursor.fetchall()
-            
+
             # Convert datetime objects to strings for JSON serialization
             for task in tasks:
                 if task.get('created_at'):
@@ -349,7 +354,7 @@ class Task:
                     task['next_reminder_date'] = task['next_reminder_date'].isoformat()
                 # Add recurrence field for compatibility with existing code
                 task['recurrence'] = task.get('schedule_type', 'one_time')
-            
+
             return tasks
         finally:
             cursor.close()
@@ -359,19 +364,20 @@ class Task:
         """Update reminder tracking for a recurring task manifest"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             # Get task schedule_type from recurring_task_manifest
             query = "SELECT schedule_type FROM recurring_task_manifest WHERE id = %s"
             cursor.execute(query, (task_id,))
             task = cursor.fetchone()
-            
+
             if not task:
                 return False
-            
+
             schedule_type = task['schedule_type']
-            next_reminder_date = self._calculate_next_reminder_date(schedule_type)
-            
+            next_reminder_date = self._calculate_next_reminder_date(
+                schedule_type)
+
             # Insert or update reminder record in task_reminders table
             upsert_query = """
                 INSERT INTO task_reminders (task_id, team_member_id, reminder_sent_at, next_reminder_date)
@@ -380,12 +386,13 @@ class Task:
                 reminder_sent_at = VALUES(reminder_sent_at),
                 next_reminder_date = VALUES(next_reminder_date)
             """
-            cursor.execute(upsert_query, (task_id, team_member_id, datetime.now(), next_reminder_date))
+            cursor.execute(upsert_query, (task_id, team_member_id,
+                           datetime.now(), next_reminder_date))
             conn.commit()
-            
+
             print(f"✅ Reminder tracking updated for task {task_id}")
             return True
-            
+
         except Exception as e:
             conn.rollback()
             print(f"Error updating task reminder: {e}")
@@ -397,7 +404,7 @@ class Task:
     def _calculate_next_reminder_date(self, recurrence):
         """Calculate next reminder date based on recurrence pattern"""
         today = datetime.now().date()
-        
+
         if recurrence == 'daily':
             return today + timedelta(days=1)
         elif recurrence == 'weekly':
@@ -427,7 +434,7 @@ class Task:
         """Get recurring tasks assigned to a specific user"""
         conn = self.get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         try:
             query = """
                 SELECT rtm.*, p.name as property_name,
@@ -442,7 +449,7 @@ class Task:
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
-            
+
             for task in tasks:
                 if task.get('created_at'):
                     task['created_at'] = task['created_at'].isoformat()
@@ -454,8 +461,49 @@ class Task:
                     task['start_date'] = task['start_date'].isoformat()
                 # Store recurrence from schedule_type
                 task['recurrence'] = task.get('schedule_type', 'one_time')
-            
+
             return tasks
         finally:
             cursor.close()
             conn.close()
+
+    def add_completion_images_direct(self, task_id, image_filename, user_id):
+        """Add completion image directly to database (fallback method)"""
+        try:
+            connection = self.get_connection()
+            cursor = connection.cursor(dictionary=True)
+
+            # First get current images
+            cursor.execute(
+                "SELECT completion_images FROM tasks WHERE id = %s", (task_id,))
+            task = cursor.fetchone()
+
+            current_images = []
+            if task and task['completion_images']:
+                try:
+                    current_images = json.loads(task['completion_images'])
+                except:
+                    current_images = []
+
+            # Add new image (max 3)
+            if len(current_images) < 3:
+                current_images.append(image_filename)
+
+            # Update task
+            cursor.execute("""
+                UPDATE tasks 
+                SET completion_images = %s, 
+                    image_added_at = NOW(),
+                    status = 'completed',
+                    completed_at = NOW()
+                WHERE id = %s
+            """, (json.dumps(current_images), task_id))
+
+            connection.commit()
+            cursor.close()
+            connection.close()
+
+            return True
+        except Exception as e:
+            print(f"❌ Error adding completion image directly: {e}")
+            return False

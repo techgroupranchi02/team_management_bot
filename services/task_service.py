@@ -3,6 +3,7 @@ from models.task import Task
 from services.whatsapp_service import WhatsAppService
 from services.image_service import ImageService
 from services.language_service import LanguageService
+import os
 
 class TaskService:
     def __init__(self, db_config):
@@ -150,7 +151,7 @@ class TaskService:
                     f"Task: \"{task['title']}\"\n"
                 )
                 # Only ask for photo if it's required but not provided yet
-                if task.get('is_photo_required') == 1 and not task.get('completion_image'):
+                if task.get('is_photo_required') == 1 and not task.get('completion_images'):
                     photo_required_msg = self.whatsapp_service._get_translated_message('photo_required', language)
                     response_message += f"\n{photo_required_msg}"
             else:
@@ -161,11 +162,11 @@ class TaskService:
 
         self.whatsapp_service.send_message(phone_number, response_message, language)
 
-    def handle_image_upload(self, member, phone_number, media_url, language):
+    def handle_image_upload(self, member, phone_number, media_id, language):
         """Handle image upload from WhatsApp with language support"""
         try:
             print(f"🖼️ Processing image upload from {phone_number}")
-            print(f"📎 Media URL: {media_url}")
+            print(f"📎 Media ID: {media_id}")
             
             # Get tasks that need photos
             pending_photo_tasks = self.task_model.get_pending_photo_tasks(member['id'])
@@ -178,11 +179,11 @@ class TaskService:
             # Use the most recent task that needs a photo
             task = pending_photo_tasks[0]
             
-            print(f"📋 Found task to attach image: {task['title']}")
-
-            # Download the image from Twilio
-            image_path = self.image_service.download_twilio_media(
-                media_url, 
+            print(f"📋 Found task to attach image: {task['title']} (ID: {task['id']})")
+            
+            # Download the image from WhatsApp Meta API
+            image_path = self.image_service.download_meta_media(
+                media_id, 
                 task['id'], 
                 member['id']
             )
@@ -192,54 +193,85 @@ class TaskService:
                 self.whatsapp_service.send_message(phone_number, download_error_msg, language)
                 return
 
-            # Try to upload to Cloudinary if configured
-            cloudinary_url = self.image_service.upload_to_cloudinary(
+            print(f"✅ Image downloaded: {image_path}")
+            
+            # Upload to backend API instead of Cloudinary
+            # Get client_id from task or member data
+            client_id = task.get('client_id')
+            
+            if not client_id:
+                # Try to get client_id from member
+                client_id = member.get('client_id')
+            
+            if not client_id:
+                print("⚠️ No client_id found, trying to get from task details")
+                # Try to get client_id from task details
+                task_details = self.task_model.get_task_by_id(task['id'])
+                if task_details:
+                    client_id = task_details.get('client_id')
+            
+            if not client_id:
+                print("❌ Could not determine client_id for API call")
+                # Fall back to updating directly in database
+                filename = os.path.basename(image_path)  # FIXED: using os module
+                success = self.task_model.add_completion_images_direct(
+                    task['id'], 
+                    filename, 
+                    member['id']
+                )
+                
+                if success:
+                    response_message = f"✅ Photo attached to task: {task['title']}"
+                else:
+                    response_message = "❌ Error saving image to task."
+                
+                self.whatsapp_service.send_message(phone_number, response_message, language)
+                return
+            
+            print(f"📤 Uploading to backend API for client: {client_id}")
+            
+            # Upload to backend API
+            uploaded_filename = self.image_service.upload_to_backend(
                 image_path, 
                 task['id'], 
-                member['id']
-            )
-
-            # Store either Cloudinary URL or local path
-            image_url_to_store = cloudinary_url or f"local:{image_path}"
-            
-            # Update task with image reference and auto-complete if needed
-            success, result_type = self.task_model.add_completion_image(
-                task['id'], 
-                image_url_to_store, 
-                member['id']
+                client_id
             )
             
-            if success:
+            if uploaded_filename:
+                # Successfully uploaded via API
                 image_uploaded_msg = self.whatsapp_service._get_translated_message('image_uploaded', language)
+                task_completed_msg = self.whatsapp_service._get_translated_message('task_completed', language)
                 
-                if result_type == "completed":
-                    task_completed_msg = self.whatsapp_service._get_translated_message('task_completed', language)
-                    response_message = (
-                        f"{task_completed_msg} 🎉\n\n"
-                        f"📋 Task: {task['title']}\n"
-                        f"🏠 Property: {task.get('property_name', 'N/A')}\n\n"
-                        f"{image_uploaded_msg}\n"
-                    )
-                else:
-                    response_message = (
-                        f"{image_uploaded_msg}\n\n"
-                        f"📋 Task: {task['title']}\n"  
-                        f"🏠 Property: {task.get('property_name', 'N/A')}\n\n"
-                        f"Status: {task.get('status', 'N/A')}\n"
-                    )
-                
-                if cloudinary_url:
-                    response_message += f"\n📸 View image: {cloudinary_url}"
-                
-                response_message += f"\n\n{self.whatsapp_service._get_translated_message('thank_you', language) or 'Thank you for documenting your work!'} 📸"
-                
+                response_message = (
+                    f"{task_completed_msg} 🎉\n\n"
+                    f"📋 Task: {task['title']}\n"
+                    f"🏠 Property: {task.get('property_name', 'N/A')}\n\n"
+                    f"{image_uploaded_msg}\n"
+                    f"✅ Task marked as completed automatically!\n\n"
+                    f"{self.whatsapp_service._get_translated_message('thank_you', language) or 'Thank you for documenting your work!'} 📸"
+                )
             else:
-                response_message = "❌ Error saving image to task. Please try again."
+                # Fallback to direct database update
+                print("⚠️ Backend upload failed, falling back to direct update")
+                filename = os.path.basename(image_path)  # FIXED: using os module
+                success = self.task_model.add_completion_images_direct(
+                    task['id'], 
+                    filename, 
+                    member['id']
+                )
+                
+                if success:
+                    response_message = f"✅ Photo attached to task: {task['title']}\n⚠️ (Backend API not available)"
+                else:
+                    response_message = "❌ Error saving image to task."
 
             self.whatsapp_service.send_message(phone_number, response_message, language)
 
         except Exception as e:
             print(f"❌ Error in image upload: {e}")
+            import traceback
+            traceback.print_exc()
+            
             error_msg = self.whatsapp_service._get_translated_message('upload_error', language) or f"❌ Error processing image: {str(e)}\n\nPlease try again or contact support."
             self.whatsapp_service.send_message(phone_number, error_msg, language)
 
