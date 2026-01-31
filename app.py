@@ -1,3 +1,4 @@
+from enum import member
 from flask import Flask, request, jsonify
 import mysql.connector
 from dotenv import load_dotenv
@@ -18,11 +19,11 @@ logger = logging.getLogger(__name__)
 
 # Database configuration
 DB_CONFIG = {
-    'host': os.getenv('DB_HOST', '31.97.230.38'),
-    'port': int(os.getenv('DB_PORT', 4000)),
-    'user': os.getenv('DB_USER', 'mysqluser'),
-    'password': os.getenv('DB_PASSWORD', 'mysqlpassword'),
-    'database': os.getenv('DB_NAME', 'airbnb_db_copy'),
+    'host': os.getenv('DB_HOST', ),
+    'port': int(os.getenv('DB_PORT', )),
+    'user': os.getenv('DB_USER', ),
+    'password': os.getenv('DB_PASSWORD', ),
+    'database': os.getenv('DB_NAME', ),
     'charset': 'utf8mb4',
     'buffered': True,  # Add this line
     'autocommit': True 
@@ -73,9 +74,6 @@ def whatsapp_webhook():
         # Meta sends JSON data, not form data
         data = request.get_json()
         
-        # Log all incoming data for debugging
-        logger.info(f"Incoming Meta webhook data: {json.dumps(data, indent=2) if data else 'No data'}")
-        
         if not data or 'entry' not in data:
             logger.info("No valid message data in webhook")
             return '', 200
@@ -86,64 +84,131 @@ def whatsapp_webhook():
                 if change.get('field') == 'messages':
                     value = change.get('value', {})
                     
-                    # Extract contacts and messages
-                    contacts = value.get('contacts', [])
-                    messages = value.get('messages', [])
+                    # Check if this is a message or a status update
+                    if 'messages' in value:
+                        # This is an actual message from user
+                        messages = value.get('messages', [])
+                        contacts = value.get('contacts', [])
+                        
+                        if messages:
+                            message = messages[0]
+                            message_type = message.get('type')
+                            from_number = message.get('from', '')
+                            
+                            # Get contact name if available
+                            contact_name = contacts[0].get('profile', {}).get('name', '') if contacts else ''
+                            
+                            # Get member info
+                            clean_phone = from_number.replace('whatsapp:', '')
+                            member = task_service.team_member_model.find_by_phone(clean_phone)
+                            
+                            logger.info(f"📨 Message type: {message_type} from: {from_number} (Contact: {contact_name})")
+                            
+                            try:
+                                if message_type == 'text':
+                                    incoming_msg = message.get('text', {}).get('body', '').strip()
+                                    logger.info(f"📝 Text message: {incoming_msg}")
+                                    
+                                    if incoming_msg.lower().startswith('join'):
+                                        logger.info(f"Join command received: {incoming_msg}")
+                                    else:
+                                        # Process text message
+                                        task_service.handle_message(f"whatsapp:{from_number}", incoming_msg, None)
+                                
+                                elif message_type == 'image':
+                                    # Get image information
+                                    image_data = message.get('image', {})
+                                    media_id = image_data.get('id', '')
+                                    caption = image_data.get('caption', '')
+                                    
+                                    logger.info(f"🖼️ Image message, Media ID: {media_id}, Caption: {caption}")
+                                    
+                                    # Process image upload with caption (if any)
+                                    task_service.handle_message(f"whatsapp:{from_number}", caption or "", media_id)
+                                
+                                elif message_type == 'interactive':
+                                    # Handle interactive messages
+                                    interactive_data = message.get('interactive', {})
+                                    interactive_type = interactive_data.get('type')
+                                    
+                                    if interactive_type == 'button_reply':
+                                        button_reply = interactive_data.get('button_reply', {})
+                                        if button_reply:
+                                            button_id = button_reply.get('id', '')
+                                            title = button_reply.get('title', '')
+                                            logger.info(f"🔄 Button click: {button_id} - {title}")
+                                            # Send the button title as the message
+                                            task_service.handle_message(f"whatsapp:{from_number}", title, None)
+                                    
+                                    elif interactive_type == 'list_reply':
+                                        list_reply = interactive_data.get('list_reply', {})
+                                        if list_reply:
+                                            list_id = list_reply.get('id', '')
+                                            list_title = list_reply.get('title', '')
+                                            list_description = list_reply.get('description', '')
+                                            logger.info(f"📋 List selection: {list_id} - {list_title}")
+                                            
+                                            if member:
+                                                # Handle settings menu selections
+                                                if list_id == "property_info":
+                                                    # Show current property info
+                                                    task_service.show_current_property_info(member, f"whatsapp:{from_number}", 'en')
+                                                elif list_id == "property_change":
+                                                    # Show property selection menu
+                                                    task_service.show_property_selection_menu(member, f"whatsapp:{from_number}", 'en')
+                                                elif list_id == "back_main":
+                                                    # Return to main menu
+                                                    task_service.show_main_menu(member, f"whatsapp:{from_number}", 'en')
+                                                elif list_id == "language_change":
+                                                    # Handle language change
+                                                    task_service.handle_language_change(member, f"whatsapp:{from_number}", 'en')
+                                                elif list_id.startswith('lang_'):
+                                                    # Language selection
+                                                    if list_id == "lang_en":
+                                                        task_service.save_language_preference(f"whatsapp:{from_number}", 'en', 'English')
+                                                    elif list_id == "lang_hi":
+                                                        task_service.save_language_preference(f"whatsapp:{from_number}", 'hi', 'Hindi')
+                                                    elif list_id == "lang_es":
+                                                        task_service.save_language_preference(f"whatsapp:{from_number}", 'es', 'Spanish')
+                                                elif list_id == "back_settings":
+                                                    # Return to settings
+                                                    task_service.show_settings_menu(member, f"whatsapp:{from_number}", 'en')
+                                                elif list_id.startswith('property_'):
+                                                    # Property selection from property list
+                                                    property_id = list_id.replace('property_', '')
+                                                    logger.info(f"🎯 Property selected: ID={property_id}, Name={list_title}")
+                                                    task_service.handle_property_selection_result(f"whatsapp:{from_number}", property_id, list_title)
+                                                else:
+                                                    # Send list title as regular message
+                                                    task_service.handle_message(f"whatsapp:{from_number}", list_title, None)
+                                            else:
+                                                logger.error(f"Member not found for {from_number}")
+                                                # Fallback to regular message handling
+                                                task_service.handle_message(f"whatsapp:{from_number}", list_title, None)
+                                
+                                else:
+                                    logger.info(f"⚠️ Unhandled message type: {message_type}")
+                            
+                            except Exception as e:
+                                # Log error but don't crash - return 200 to Meta
+                                logger.error(f"Error processing message: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                return '', 200  # IMPORTANT: Return 200 even on error
                     
-                    if messages:
-                        message = messages[0]
-                        message_type = message.get('type')
-                        from_number = message.get('from', '')
-                        
-                        # Get contact name if available
-                        contact_name = contacts[0].get('profile', {}).get('name', '') if contacts else ''
-                        
-                        logger.info(f"📨 Message type: {message_type} from: {from_number} (Contact: {contact_name})")
-                        
-                        if message_type == 'text':
-                            incoming_msg = message.get('text', {}).get('body', '').strip()
-                            logger.info(f"📝 Text message: {incoming_msg}")
-                            
-                            if incoming_msg.lower().startswith('join'):
-                                logger.info(f"Join command received: {incoming_msg}")
-                            else:
-                                # Process text message
-                                task_service.handle_message(f"whatsapp:{from_number}", incoming_msg, None)
-                        
-                        elif message_type == 'image':
-                            # Get image information
-                            image_data = message.get('image', {})
-                            media_id = image_data.get('id', '')
-                            caption = image_data.get('caption', '')
-                            
-                            logger.info(f"🖼️ Image message, Media ID: {media_id}, Caption: {caption}")
-                            
-                            # Process image upload with caption (if any)
-                            task_service.handle_message(f"whatsapp:{from_number}", caption or "", media_id)
-                        
-                        elif message_type == 'interactive':
-                            # Handle button clicks
-                            interactive_data = message.get('interactive', {})
-                            button_reply = interactive_data.get('button_reply', {})
-                            list_reply = interactive_data.get('list_reply', {})
-                            
-                            if button_reply:
-                                button_id = button_reply.get('id', '')
-                                title = button_reply.get('title', '')
-                                logger.info(f"🔄 Button click: {button_id} - {title}")
-                                # You can handle button actions here
-                                task_service.handle_message(f"whatsapp:{from_number}", title, None)
-                        
-                        else:
-                            logger.info(f"⚠️ Unhandled message type: {message_type}")
+                    elif 'statuses' in value:
+                        # This is a status update for a message we sent (ignore to reduce logs)
+                        pass
         
         return '', 200
 
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
-        logger.error(f"Request data: {request.data}")
-        return '', 500
-
+        import traceback
+        traceback.print_exc()
+        # Still return 200 to Meta to prevent retries
+        return '', 200
+    
 @app.route('/whatsapp/webhook', methods=['GET'])
 def verify_webhook():
     """Verify webhook for Facebook/Meta WhatsApp Business API"""

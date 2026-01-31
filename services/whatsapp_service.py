@@ -5,6 +5,7 @@ from services.language_service import LanguageService
 import logging
 import json
 
+
 load_dotenv()
 
 class WhatsAppService:
@@ -19,57 +20,6 @@ class WhatsAppService:
             
         self.language_service = LanguageService()
         self.logger = logging.getLogger(__name__)
-
-    def send_message(self, to, message, language='en'):
-        try:
-            # Clean and format phone number for Meta API
-            clean_to = self._clean_phone_number_for_meta(to)
-            
-            print(f"📤 Attempting to send to: {clean_to}, Original: {to}")
-            print(f"📤 Message: {message[:50]}...")
-            
-            if not self._is_valid_phone_number(clean_to):
-                self.logger.error(f"Invalid phone number format: {clean_to}")
-                return False
-
-            headers = {
-                'Authorization': f'Bearer {self.meta_access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            payload = {
-                "messaging_product": "whatsapp",
-                "recipient_type": "individual",
-                "to": clean_to,
-                "type": "text",
-                "text": {
-                    "preview_url": False,
-                    "body": message
-                }
-            }
-            
-            print(f"📤 Headers: {headers}")
-            print(f"📤 Payload: {json.dumps(payload, indent=2)}")
-            
-            response = requests.post(self.graph_api_url, headers=headers, json=payload)
-            
-            print(f"📤 Response Status: {response.status_code}")
-            print(f"📤 Response: {response.text}")
-            
-            if response.status_code == 200:
-                response_data = response.json()
-                message_id = response_data.get('messages', [{}])[0].get('id', 'N/A')
-                self.logger.info(f"✅ WhatsApp message sent successfully! Message ID: {message_id}")
-                return True
-            else:
-                self.logger.error(f"❌ Failed to send WhatsApp message. Status: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"❌ Error sending WhatsApp message: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return False
 
     def _clean_phone_number_for_meta(self, phone_number):
         """Clean and format phone number for Meta API"""
@@ -262,3 +212,381 @@ class WhatsAppService:
             'overdue': '⚠️'
         }
         return emojis.get(status, '📝')
+
+    
+    
+    
+    def send_interactive_list(self, to, body_text, button_text, sections, language='en'):
+        """Send an interactive list message"""
+        try:
+            clean_to = self._clean_phone_number_for_meta(to)
+            
+            if not self._is_valid_phone_number(clean_to):
+                self.logger.error(f"Invalid phone number format: {clean_to}")
+                return False
+
+            headers = {
+                'Authorization': f'Bearer {self.meta_access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Build the interactive list structure
+            list_sections = []
+            
+            for section in sections:
+                section_dict = {
+                    "title": section['title'],
+                    "rows": []
+                }
+                
+                for row in section['rows']:
+                    row_dict = {
+                        "id": row['id'],
+                        "title": row['title']
+                    }
+                    
+                    if 'description' in row:
+                        row_dict["description"] = row['description']
+                    
+                    section_dict["rows"].append(row_dict)
+                
+                list_sections.append(section_dict)
+            
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": clean_to,
+                "type": "interactive",
+                "interactive": {
+                    "type": "list",
+                    "body": {
+                        "text": body_text
+                    },
+                    "action": {
+                        "button": button_text,
+                        "sections": list_sections
+                    }
+                }
+            }
+            
+            print(f"📋 Sending interactive list with {len(sections)} sections")
+            
+            response = requests.post(self.graph_api_url, headers=headers, json=payload)
+            
+            print(f"📋 Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                self.logger.info("✅ Interactive list sent successfully!")
+                return True
+            else:
+                self.logger.error(f"❌ Failed to send interactive list: {response.text}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error sending interactive list: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def send_message(self, to, message, language='en', buttons=None):
+        try:
+            # Clean and format phone number for Meta API
+            clean_to = self._clean_phone_number_for_meta(to)
+            
+            print(f"📤 Attempting to send to: {clean_to}, Original: {to}")
+            print(f"📤 Message: {message[:50]}...")
+            
+            if not self._is_valid_phone_number(clean_to):
+                self.logger.error(f"Invalid phone number format: {clean_to}")
+                return False
+
+            headers = {
+                'Authorization': f'Bearer {self.meta_access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            if buttons:
+                # Create interactive button message
+                payload = {
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": clean_to,
+                    "type": "interactive",
+                    "interactive": {
+                        "type": "button",
+                        "body": {
+                            "text": message
+                        },
+                        "action": {
+                            "buttons": buttons
+                        }
+                    }
+                }
+                
+                # Debug: Print the button structure
+                print(f"🔘 Button structure: {json.dumps(payload['interactive'], indent=2)}")
+                
+                response = requests.post(self.graph_api_url, headers=headers, json=payload)
+                
+                print(f"📤 Response Status: {response.status_code}")
+                print(f"📤 Response: {response.text[:200]}")
+                
+                if response.status_code == 200:
+                    response_data = response.json()
+                    message_id = response_data.get('messages', [{}])[0].get('id', 'N/A')
+                    self.logger.info(f"✅ Interactive button message sent successfully! Message ID: {message_id}")
+                    return True
+                else:
+                    self.logger.error(f"❌ Failed to send interactive button message. Status: {response.status_code}, Error: {response.text}")
+                    # IMPORTANT: Don't fall back to text message - fix the button issue instead
+                    # Check if buttons are properly formatted
+                    self._debug_button_format(buttons)
+                    
+                    # Try sending the message without buttons but with instructions
+                    return self._send_fallback_message(clean_to, message, headers, language)
+                    
+            else:
+                # Regular text message
+                payload = {
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": clean_to,
+                    "type": "text",
+                    "text": {
+                        "preview_url": False,
+                        "body": message
+                    }
+                }
+                
+                print(f"📤 Sending text message...")
+                
+                response = requests.post(self.graph_api_url, headers=headers, json=payload)
+                
+                print(f"📤 Response Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    self.logger.info("✅ Text message sent successfully!")
+                    return True
+                else:
+                    self.logger.error(f"❌ Failed to send text message: {response.text}")
+                    return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error sending WhatsApp message: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _send_fallback_message(self, clean_to, message, headers, language='en'):
+        """Send fallback message when interactive buttons fail"""
+        try:
+            # Send a simpler message with text instructions
+            fallback_payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": clean_to,
+                "type": "text",
+                "text": {
+                    "preview_url": False,
+                    "body": message + "\n\nPlease reply with:\n1. Tasks\n2. Photos\n3. Recurring\n4. Settings\n5. Help"
+                }
+            }
+            
+            fallback_response = requests.post(self.graph_api_url, headers=headers, json=fallback_payload)
+            
+            if fallback_response.status_code == 200:
+                self.logger.info("✅ Fallback text message sent successfully!")
+                return True
+            else:
+                self.logger.error(f"❌ Fallback message also failed: {fallback_response.text}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error in fallback: {str(e)}")
+            return False
+
+    def _debug_button_format(self, buttons):
+        """Debug button formatting issues"""
+        self.logger.info("🔧 Debugging button format...")
+        
+        # Check button structure
+        for i, button in enumerate(buttons):
+            self.logger.info(f"Button {i+1}:")
+            self.logger.info(f"  Type: {button.get('type')}")
+            reply = button.get('reply', {})
+            self.logger.info(f"  ID: {reply.get('id')}")
+            self.logger.info(f"  Title: {reply.get('title')}")
+            
+        # Check Meta API requirements
+        self.logger.info("🔧 Meta API Requirements:")
+        self.logger.info("1. Max 3 reply buttons")
+        self.logger.info("2. Button IDs must be unique")
+        self.logger.info("3. Button titles max 20 characters")
+        self.logger.info("4. Only 'reply' button type supported")
+        
+        # Validate buttons
+        if len(buttons) > 3:
+            self.logger.error("❌ Too many buttons! Max is 3.")
+            
+        for button in buttons:
+            title = button.get('reply', {}).get('title', '')
+            if len(title) > 20:
+                self.logger.error(f"❌ Button title too long: '{title}' (max 20 chars)")
+
+    def _create_welcome_buttons(self, language='en'):
+        """Create button options for welcome message - PROPERLY FORMATTED"""
+        # Use simple, short titles
+        buttons = [
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "btn_tasks",
+                    "title": "📋 Tasks"
+                }
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "btn_photos",
+                    "title": "📷 Photos"
+                }
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "btn_settings",
+                    "title": "⚙️ Settings"
+                }
+            }
+        ]
+        
+        return buttons
+
+    def _create_task_action_buttons(self, language='en'):
+        """Create buttons for task actions"""
+        button_labels = {
+            'en': ["📝 Update Status", "📋 View Tasks", "🏠 Main Menu"],
+            'hi': ["📝 Status Update", "📋 View Tasks", "🏠 Main Menu"],  # Simplified Hindi
+            'es': ["📝 Update Status", "📋 View Tasks", "🏠 Main Menu"],  # Simplified Spanish
+            'fr': ["📝 Update Status", "📋 View Tasks", "🏠 Main Menu"]   # Simplified French
+        }
+        
+        lang = 'en'  # Use English for now to simplify
+        labels = button_labels[lang]
+        
+        buttons = []
+        for i, label in enumerate(labels[:3], 1):  # Max 3 buttons
+            buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": f"action_{i}",
+                    "title": label[:20]
+                }
+            })
+        
+        return buttons
+
+    def format_task_list_with_buttons(self, tasks, language='en'):
+        if not tasks:
+            return self._get_translated_message("no_tasks", language), None
+
+        task_list = self._get_translated_message("task_list_header", language).format(len(tasks))
+        
+        for i, task in enumerate(tasks):
+            task_list += f"*{i + 1}. {task['title']}*\n"
+            
+            # Add property name if available
+            if task.get('property_name'):
+                property_text = self._get_translated_message("property", language)
+                task_list += f"   🏠 {property_text}: {task['property_name']}\n"
+            
+            description = task.get('description', self._get_translated_message("no_description", language))
+            task_list += f"   📝 {description}\n"
+            
+            status_text = self._get_translated_message("status", language)
+            status_emoji = self.get_status_emoji(task['status'])
+            task_list += f"   {status_text}: {status_emoji} {task['status']}\n\n"
+        
+        # Add selection instruction
+        task_list += "*Select a task to update:*"
+        
+        # Create buttons for task selection
+        buttons = []
+        for i, task in enumerate(tasks[:3], 1):  # Show max 3 tasks with buttons
+            task_title_short = task['title'][:15] + "..." if len(task['title']) > 15 else task['title']
+            buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": f"task_{task['id']}",
+                    "title": f"#{i}: {task_title_short}"
+                }
+            })
+        
+        # Add view all button if more than 3 tasks
+        if len(tasks) > 3:
+            buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": "view_all_tasks",
+                    "title": "📋 View All"
+                }
+            })
+        
+        return task_list, buttons
+
+    def _create_task_completion_buttons(self, task_id, language='en'):
+        """Create buttons for completing a specific task"""
+        button_labels = {
+            'en': ["✅ Mark Complete", "📝 Update Status", "📋 Back to Tasks"],
+            'hi': ["✅ पूरा करें", "📝 स्थिति बदलें", "📋 वापस कार्य"],
+            'es': ["✅ Completar", "📝 Cambiar Estado", "📋 Volver"],
+            'fr': ["✅ Terminer", "📝 Modifier", "📋 Retour"]
+        }
+        
+        lang = language if language in button_labels else 'en'
+        labels = button_labels[lang]
+        
+        buttons = []
+        for i, label in enumerate(labels[:3], 1):
+            buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": f"complete_{task_id}_{i}",  # Include task_id in button ID
+                    "title": label[:20]
+                }
+            })
+        
+        return buttons
+
+    def _create_task_status_buttons(self, task_id, language='en'):
+        """Create buttons for selecting task status"""
+        button_labels = {
+            'en': ["⏳ Pending", "🔄 In Progress", "✅ Complete", "📋 Back"],
+            'hi': ["⏳ लंबित", "🔄 चालू", "✅ पूरा", "📋 वापस"],
+            'es': ["⏳ Pendiente", "🔄 En Progreso", "✅ Completado", "📋 Atrás"],
+            'fr': ["⏳ En Attente", "🔄 En Cours", "✅ Terminé", "📋 Retour"]
+        }
+        
+        lang = language if language in button_labels else 'en'
+        labels = button_labels[lang]
+        
+        buttons = []
+        for i, label in enumerate(labels[:3], 1):  # First 3 status buttons
+            buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": f"status_{task_id}_{label.lower().replace(' ', '_')}",
+                    "title": label[:20]
+                }
+            })
+        
+        # Add back button
+        buttons.append({
+            "type": "reply",
+            "reply": {
+                "id": f"back_tasks_{task_id}",
+                "title": labels[3][:20] if len(labels) > 3 else "📋 Back"
+            }
+        })
+        
+        return buttons    

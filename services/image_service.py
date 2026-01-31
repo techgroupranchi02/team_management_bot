@@ -12,7 +12,7 @@ class ImageService:
         self.meta_access_token = os.getenv("META_ACCESS_TOKEN")
         self.api_version = os.getenv("META_API_VERSION", "v19.0")
         self.image_storage_path = "task_images"
-        self.backend_api_url = os.getenv("BACKEND_API_URL", "http://localhost:3000")
+        self.backend_api_url = os.getenv("BACKEND_API_URL")
         self.api_auth_token = os.getenv("API_AUTH_TOKEN")
         os.makedirs(self.image_storage_path, exist_ok=True)
 
