@@ -208,8 +208,8 @@ class WhatsAppService:
             'pending': '⏳',
             'in_progress': '🔄',
             'completed': '✅',
-            'cancelled': '❌',
-            'overdue': '⚠️'
+            'skipped': '⏭️'
+            
         }
         return emojis.get(status, '📝')
 
@@ -546,36 +546,50 @@ class WhatsAppService:
         lang = language if language in button_labels else 'en'
         labels = button_labels[lang]
         
-        buttons = []
-        for i, label in enumerate(labels[:3], 1):
-            buttons.append({
+        buttons = [
+            {
                 "type": "reply",
                 "reply": {
-                    "id": f"complete_{task_id}_{i}",  # Include task_id in button ID
-                    "title": label[:20]
+                    "id": f"mark_complete_{task_id}",
+                    "title": labels[0][:20]
                 }
-            })
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": f"update_status_{task_id}",
+                    "title": labels[1][:20]
+                }
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "back_to_tasks",
+                    "title": labels[2][:20]
+                }
+            }
+        ]
         
         return buttons
 
     def _create_task_status_buttons(self, task_id, language='en'):
         """Create buttons for selecting task status"""
         button_labels = {
-            'en': ["⏳ Pending", "🔄 In Progress", "✅ Complete", "📋 Back"],
-            'hi': ["⏳ लंबित", "🔄 चालू", "✅ पूरा", "📋 वापस"],
-            'es': ["⏳ Pendiente", "🔄 En Progreso", "✅ Completado", "📋 Atrás"],
-            'fr': ["⏳ En Attente", "🔄 En Cours", "✅ Terminé", "📋 Retour"]
+            'en': ["⏳ Pending", "🔄 In Progress", "✅ Complete", "⏭️ Skipped", "📋 Back"],
+            'hi': ["⏳ लंबित", "🔄 चालू", "✅ पूरा", "⏭️ छोड़ा गया", "📋 वापस"],
+            'es': ["⏳ Pendiente", "🔄 En Progreso", "✅ Completado", "⏭️ Omitido", "📋 Atrás"],
+            'fr': ["⏳ En Attente", "🔄 En Cours", "✅ Terminé", "⏭️ Ignoré", "📋 Retour"]
         }
         
         lang = language if language in button_labels else 'en'
         labels = button_labels[lang]
         
         buttons = []
-        for i, label in enumerate(labels[:3], 1):  # First 3 status buttons
+        for i, label in enumerate(labels[:4], 1):  # First 4 are status options
             buttons.append({
                 "type": "reply",
                 "reply": {
-                    "id": f"status_{task_id}_{label.lower().replace(' ', '_')}",
+                    "id": f"status_{task_id}_{label.lower().replace(' ', '_').replace('⏭️_', '')}",
                     "title": label[:20]
                 }
             })
@@ -585,7 +599,7 @@ class WhatsAppService:
             "type": "reply",
             "reply": {
                 "id": f"back_tasks_{task_id}",
-                "title": labels[3][:20] if len(labels) > 3 else "📋 Back"
+                "title": labels[4][:20] if len(labels) > 4 else "📋 Back"
             }
         })
         

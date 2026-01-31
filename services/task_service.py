@@ -1,3 +1,4 @@
+from email.mime import message
 from models.team_member import TeamMember
 from models.task import Task
 from services.whatsapp_service import WhatsAppService
@@ -100,6 +101,7 @@ class TaskService:
             '⏳ Pending': lambda: self.handle_status_selection(member, clean_phone, 'pending', user_language),
             '🔄 In Progress': lambda: self.handle_status_selection(member, clean_phone, 'in_progress', user_language),
             '✅ Complete': lambda: self.handle_status_selection(member, clean_phone, 'completed', user_language),
+            '⏭️ Skipped': lambda: self.handle_status_selection(member, clean_phone, 'skipped', user_language), 
         }
         
         # Check if message matches any button title
@@ -123,6 +125,9 @@ class TaskService:
             
             # Task button IDs
             'help_main_menu': lambda: self.show_main_menu(member, clean_phone, user_language),
+
+            # Task action button IDs
+            'back_to_tasks': lambda: self.handle_list_tasks(member, clean_phone, user_language),
             
             # Property button IDs
             'property_continue': lambda: self.handle_list_tasks(member, clean_phone, user_language),
@@ -151,13 +156,14 @@ class TaskService:
         if message.startswith('status_'):
             parts = message.split('_')
             if len(parts) >= 3:
-                status_type = parts[1]  # pending, inprogress, complete
+                status_type = parts[1]  # pending, inprogress, complete, skipped
                 task_id = parts[2]
                 
                 status_map = {
                     'pending': 'pending',
                     'inprogress': 'in_progress',
-                    'complete': 'completed'
+                    'complete': 'completed',
+                    'skipped': 'skipped'
                 }
                 
                 status = status_map.get(status_type, status_type)
@@ -168,6 +174,25 @@ class TaskService:
         if message.startswith('back_task_'):
             task_id = message.replace('back_task_', '')
             self.show_task_options(member, clean_phone, task_id, user_language)
+            return
+        
+        # Check for mark_complete button IDs (like "mark_complete_123")
+        if message.startswith('mark_complete_'):
+            task_id = message.replace('mark_complete_', '')
+            self.mark_task_complete(member, clean_phone, task_id, user_language)
+            return
+
+        # Check for update_status button IDs (like "update_status_123") 
+        if message.startswith('update_status_'):
+            task_id = message.replace('update_status_', '')
+            # Store the task_id in user context
+            self._store_user_context(clean_phone, {'current_task_id': task_id})
+            self.show_status_options(member, clean_phone, task_id, user_language)
+            return
+
+        # Check for back_to_tasks button
+        if message == 'back_to_tasks':
+            self.handle_list_tasks(member, clean_phone, user_language)
             return
         
         # For text commands (lowercase processing)
@@ -632,14 +657,31 @@ class TaskService:
 
     def handle_update_status_button(self, member, phone_number, language):
         """Handle 'Update Status' button click"""
+        print(f"🔍 DEBUG: handle_update_status_button called for {phone_number}")
+        print(f"🔍 DEBUG: Checking user context...")
+        
         user_context = self._get_user_context(phone_number)
+        print(f"🔍 DEBUG: User context: {user_context}")
         
         if user_context and 'current_task_id' in user_context:
             task_id = user_context['current_task_id']
+            print(f"🔍 DEBUG: Found current_task_id: {task_id}")
+            print(f"🔍 DEBUG: Calling show_status_options with task_id: {task_id}")
             self.show_status_options(member, phone_number, task_id, language)
         else:
-            # Show task list to select from
-            self.handle_list_tasks(member, phone_number, language)
+            print(f"🔍 DEBUG: No current_task_id in context, checking for most recent task")
+            # Try to find the most recent task
+            tasks = self.task_model.get_tasks_by_user(member['id'])
+            if tasks:
+                task = tasks[0]
+                task_id = task['id']
+                print(f"🔍 DEBUG: Using most recent task ID: {task_id}")
+                self._store_user_context(phone_number, {'current_task_id': task_id})
+                self.show_status_options(member, phone_number, task_id, language)
+            else:
+                print(f"🔍 DEBUG: No tasks found, showing task list")
+                # Show task list to select from
+                self.handle_list_tasks(member, phone_number, language)
 
     def handle_back_to_task_button(self, member, phone_number, language):
         """Handle 'Back to Task' button click"""
@@ -683,7 +725,7 @@ class TaskService:
             self.handle_unknown_command(member, phone_number, language)
 
     def show_status_options(self, member, phone_number, task_id, language):
-        """Show status selection options for a task"""
+        """Show status selection options for a task using interactive list"""
         task = self.task_model.get_task_by_id(task_id, member['id'])
         
         if not task:
@@ -693,37 +735,97 @@ class TaskService:
         
         message = f"*Select status for:*\n{task['title']}\n\nCurrent: {self.whatsapp_service.get_status_emoji(task['status'])} {task['status']}"
         
-        # Create status selection buttons
-        buttons = [
+        # Create interactive list sections for status selection
+        sections = [
             {
-                "type": "reply",
-                "reply": {
-                    "id": f"status_pending_{task_id}",
-                    "title": "⏳ Pending"
-                }
+                "title": "Change Status",
+                "rows": [
+                    {
+                        "id": f"status_pending_{task_id}",
+                        "title": "⏳ Pending",
+                        "description": "Mark as pending"
+                    },
+                    {
+                        "id": f"status_inprogress_{task_id}",
+                        "title": "🔄 In Progress",
+                        "description": "Mark as in progress"
+                    },
+                    {
+                        "id": f"status_complete_{task_id}",
+                        "title": "✅ Complete",
+                        "description": "Mark as completed"
+                    },
+                    {
+                        "id": f"status_skipped_{task_id}",
+                        "title": "⏭️ Skipped",
+                        "description": "Mark as skipped"
+                    }
+                ]
             },
             {
-                "type": "reply",
-                "reply": {
-                    "id": f"status_inprogress_{task_id}",
-                    "title": "🔄 In Progress"
-                }
-            },
-            {
-                "type": "reply",
-                "reply": {
-                    "id": f"status_complete_{task_id}",
-                    "title": "✅ Complete"
-                }
-            },
-            {
-                "type": "reply",
-                "reply": {
-                    "id": f"back_task_{task_id}",
-                    "title": "⬅️ Back to Task"
-                }
+                "title": "Navigation",
+                "rows": [
+                    {
+                        "id": f"back_task_{task_id}",
+                        "title": "⬅️ Back to Task",
+                        "description": "Return to task options"
+                    }
+                ]
             }
         ]
+        
+        # Send interactive list (can have more than 3 options)
+        success = self.whatsapp_service.send_interactive_list(
+            phone_number,
+            message,
+            "Select Status",
+            sections,
+            language
+        )
+        
+        if not success:
+            # Fallback to buttons with only 3 options
+            self._show_status_fallback(member, phone_number, task_id, task, language)
+
+    def _show_status_fallback(self, member, phone_number, task_id, task, language):
+        """Fallback method with only 3 buttons"""
+        message = f"*Select status for:*\n{task['title']}\n\nCurrent: {self.whatsapp_service.get_status_emoji(task['status'])} {task['status']}"
+        
+        # Show only 3 buttons: 2 status options + back button
+        current_status = task['status']
+        
+        # Define priority statuses to show
+        priority_statuses = ['completed', 'in_progress', 'pending', 'skipped']
+        
+        # Remove current status from options
+        available_statuses = [s for s in priority_statuses if s != current_status]
+        
+        buttons = []
+        # Add up to 2 status buttons
+        for i, status in enumerate(available_statuses[:2]):
+            status_title = {
+                'pending': '⏳ Pending',
+                'in_progress': '🔄 In Progress',
+                'completed': '✅ Complete',
+                'skipped': '⏭️ Skipped'
+            }.get(status, status)
+            
+            buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": f"status_{status.replace('_', '')}_{task_id}",
+                    "title": status_title
+                }
+            })
+        
+        # Add back button as the 3rd button
+        buttons.append({
+            "type": "reply",
+            "reply": {
+                "id": f"back_task_{task_id}",
+                "title": "⬅️ Back to Task"
+            }
+        })
         
         self.whatsapp_service.send_message(phone_number, message, language, buttons)
 
@@ -987,6 +1089,9 @@ class TaskService:
 
     def show_task_options(self, member, phone_number, task_id, language):
         """Show options for a specific task"""
+        # Store the current task ID in user context
+        self._store_user_context(phone_number, {'current_task_id': task_id})
+        
         task = self.task_model.get_task_by_id(task_id, member['id'])
         
         if not task:
@@ -1062,7 +1167,8 @@ class TaskService:
         status_map = {
             'pending': 'pending',
             'in_progress': 'in_progress',
-            'complete': 'completed'
+            'complete': 'completed',
+            'skipped': 'skipped'
         }
         
         db_status = status_map.get(status.lower(), status.lower())
@@ -1101,8 +1207,8 @@ class TaskService:
             self.whatsapp_service.send_message(phone_number, invalid_format_msg, language)
             return
 
-        if new_status not in ['pending', 'in_progress', 'completed']:
-            status_error_msg = self.whatsapp_service._get_translated_message('invalid_status', language) or "❌ Invalid status. Use: pending, in_progress, or completed"
+        if new_status not in ['pending', 'in_progress', 'completed', 'skipped']:
+            status_error_msg = self.whatsapp_service._get_translated_message('invalid_status', language) or "❌ Invalid status. Use: pending, in_progress, completed, or skipped"
             self.whatsapp_service.send_message(phone_number, status_error_msg, language)
             return
 
