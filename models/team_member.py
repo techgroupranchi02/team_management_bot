@@ -62,6 +62,40 @@ class TeamMember:
             cursor.close()
             conn.close()
 
+    def find_by_phone_and_client(self, phone_number, client_id):
+        """Find team member by phone number AND specific client_id."""
+        possible_numbers = self.get_possible_phone_formats(phone_number)
+
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        try:
+            # Try exact match first
+            for possible_number in possible_numbers:
+                query = "SELECT * FROM team_members WHERE phone = %s AND client_id = %s AND status = 'active'"
+                cursor.execute(query, (possible_number, client_id))
+                member = cursor.fetchone()
+                if member:
+                    print(f"✅ Team member found for phone={possible_number}, client_id={client_id}")
+                    return member
+
+            # Partial match (last 10 digits)
+            for possible_number in possible_numbers:
+                clean_number = self.clean_phone_number(possible_number)
+                if len(clean_number) >= 10:
+                    last_10 = clean_number[-10:]
+                    query = "SELECT * FROM team_members WHERE phone LIKE %s AND client_id = %s AND status = 'active'"
+                    cursor.execute(query, (f'%{last_10}', client_id))
+                    member = cursor.fetchone()
+                    if member:
+                        print(f"✅ Team member found (partial match) for client_id={client_id}")
+                        return member
+
+            return None
+        finally:
+            cursor.close()
+            conn.close()
+
     def clean_phone_number(self, phone_number):
         """Clean phone number - remove all non-digit characters"""
         if not phone_number:

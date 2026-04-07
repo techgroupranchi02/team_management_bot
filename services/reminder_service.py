@@ -35,8 +35,11 @@ class ReminderService:
             
             self.logger.info(f"Formatted reminder message: {reminder_message[:100]}...")
             
-            # Send WhatsApp message
-            success = self.whatsapp_service.send_message(phone_number, reminder_message, language)
+            # Create task action buttons
+            buttons = self._create_reminder_buttons(task['id'], language)
+            
+            # Send WhatsApp message with buttons
+            success = self.whatsapp_service.send_message(phone_number, reminder_message, language, buttons)
             
             if success:
                 self.logger.info(f"✅ Reminder sent to {task['team_member_name']} for task: {task['title']}")
@@ -50,6 +53,47 @@ class ReminderService:
         except Exception as e:
             self.logger.error(f"Error sending individual reminder to {task.get('team_member_name', 'unknown')}: {e}")
             return False
+
+    def _create_reminder_buttons(self, task_id, language='en'):
+        """Create buttons for task reminder"""
+        button_labels = {
+            'en': ["✅ Mark Complete", "📝 Update Status", "📋 Back to Tasks"],
+            'hi': ["✅ पूरा करें", "📝 स्थिति बदलें", "📋 वापस कार्य"],
+            'es': ["✅ Completar", "📝 Cambiar Estado", "📋 Volver"],
+            'fr': ["✅ Terminer", "📝 Modifier", "📋 Retour"]
+        }
+        
+        # Get language-specific labels or default to English
+        if language not in button_labels:
+            language = 'en'
+        
+        labels = button_labels[language]
+        
+        buttons = [
+            {
+                "type": "reply",
+                "reply": {
+                    "id": f"mark_complete_{task_id}",
+                    "title": labels[0][:20]
+                }
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": f"update_status_{task_id}",
+                    "title": labels[1][:20]
+                }
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "back_to_tasks",
+                    "title": labels[2][:20]
+                }
+            }
+        ]
+        
+        return buttons
 
     def start_reminder_scheduler(self):
         """Start the reminder scheduler in a separate thread"""
@@ -75,10 +119,16 @@ class ReminderService:
         schedule.every().day.at("09:00").do(self.send_daily_reminders)
         
         # Also run immediately on startup
-        self.send_daily_reminders()
+        try:
+            self.send_daily_reminders()
+        except Exception as e:
+            self.logger.error(f"Error sending initial reminders: {e}")
         
         while self.is_running:
-            schedule.run_pending()
+            try:
+                schedule.run_pending()
+            except Exception as e:
+                self.logger.error(f"Error in scheduler loop: {e}")
             time.sleep(60)  # Check every minute
 
     def send_daily_reminders(self):
@@ -86,8 +136,13 @@ class ReminderService:
         try:
             self.logger.info("🔔 Checking for recurring task reminders...")
             
-            recurring_tasks = self.task_model.get_recurring_tasks_due_for_reminder()
-            
+            try:
+                recurring_tasks = self.task_model.get_recurring_tasks_due_for_reminder()
+            except AttributeError as e:
+                self.logger.error(f"Method not found in Task model: {e}")
+                self.logger.error("Please add get_recurring_tasks_due_for_reminder() to Task model")
+                return
+                
             if not recurring_tasks:
                 self.logger.info("No recurring tasks due for reminders today")
                 return
@@ -100,33 +155,6 @@ class ReminderService:
         except Exception as e:
             self.logger.error(f"Error sending daily reminders: {e}")
 
-    def _send_individual_reminder(self, task):
-        """Send reminder for an individual recurring task"""
-        try:
-            phone_number = task['phone']
-            if not phone_number:
-                self.logger.warning(f"No phone number found for team member {task['team_member_name']}")
-                return
-
-            # Detect language preference (default to English)
-            language = 'en'  # You can enhance this by storing user language preferences
-            
-            # Format reminder message
-            reminder_message = self._format_reminder_message(task, language)
-            
-            # Send WhatsApp message
-            success = self.whatsapp_service.send_message(phone_number, reminder_message, language)
-            
-            if success:
-                self.logger.info(f"✅ Reminder sent to {task['team_member_name']} for task: {task['title']}")
-                # Update reminder tracking
-                self.task_model.update_task_reminder(task['id'], task['assigned_to'])
-            else:
-                self.logger.error(f"❌ Failed to send reminder to {task['team_member_name']}")
-                
-        except Exception as e:
-            self.logger.error(f"Error sending individual reminder: {e}")
-
     def _format_reminder_message(self, task, language='en'):
         """Format the reminder message based on language"""
         messages = {
@@ -136,8 +164,7 @@ class ReminderService:
                 'recurrence': "Frequency: {}",
                 'property': "Property: {}",
                 'description': "Description: {}",
-                'action_required': "\n\nThis is a {} task. Please complete it and update the status.",
-                'update_instruction': "\n\nTo update status, reply: *status [task-number] [status]*",
+                'action_required': "\n\nThis is a {} task. Please complete it.",
                 'recurrence_daily': "Daily",
                 'recurrence_weekly': "Weekly", 
                 'recurrence_monthly': "Monthly",
@@ -150,8 +177,7 @@ class ReminderService:
                 'recurrence': "आवृत्ति: {}",
                 'property': "संपत्ति: {}",
                 'description': "विवरण: {}",
-                'action_required': "\n\nयह एक {} कार्य है। कृपया इसे पूरा करें और स्थिति अपडेट करें।",
-                'update_instruction': "\n\nस्थिति अपडेट करने के लिए, जवाब दें: *status [संख्या] [स्थिति]*",
+                'action_required': "\n\nयह एक {} कार्य है। कृपया इसे पूरा करें।",
                 'recurrence_daily': "दैनिक",
                 'recurrence_weekly': "साप्ताहिक",
                 'recurrence_monthly': "मासिक", 
@@ -164,8 +190,7 @@ class ReminderService:
                 'recurrence': "Frecuencia: {}",
                 'property': "Propiedad: {}",
                 'description': "Descripción: {}",
-                'action_required': "\n\nEsta es una tarea {}. Por favor complétala y actualiza el estado.",
-                'update_instruction': "\n\nPara actualizar el estado, responde: *status [número] [estado]*",
+                'action_required': "\n\nEsta es una tarea {}. Por favor complétala.",
                 'recurrence_daily': "Diaria",
                 'recurrence_weekly': "Semanal",
                 'recurrence_monthly': "Mensual",
@@ -193,7 +218,6 @@ class ReminderService:
             message += lang_messages['description'].format(task['description']) + "\n"
         
         message += lang_messages['action_required'].format(recurrence_text.lower())
-        message += lang_messages['update_instruction']
         
         return message
 

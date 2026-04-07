@@ -1,9 +1,9 @@
-from services.free_translation_service import FreeTranslationService
+from services.groq_translation_service import GroqTranslationService
 import logging
 
 class LanguageService:
     def __init__(self):
-        self.translation_service = FreeTranslationService()
+        self.translation_service = GroqTranslationService()
         self.logger = logging.getLogger(__name__)
 
     def detect_language(self, text):

@@ -82,6 +82,7 @@ class Task:
                     td.title,
                     td.description,
                     td.requires_photo,
+                    td.allows_inventory_update,
                     tocc.status,
                     tocc.scheduled_date,
                     tocc.completed_at,
@@ -94,7 +95,12 @@ class Task:
                 LEFT JOIN team_members tm ON tocc.assigned_to = tm.id
                 WHERE tocc.assigned_to = %s
                 AND tocc.status != 'deleted'
-                ORDER BY tocc.scheduled_date DESC
+                ORDER BY 
+                    CASE 
+                        WHEN tocc.status IN ('pending', 'in_progress') THEN 0 
+                        ELSE 1 
+                    END,
+                    tocc.scheduled_date DESC
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
@@ -314,6 +320,7 @@ class Task:
                     td.title,
                     td.description,
                     td.requires_photo,
+                    td.allows_inventory_update,
                     tocc.status,
                     tocc.scheduled_date,
                     tocc.completed_at,
@@ -328,7 +335,12 @@ class Task:
                     WHERE tp.task_occurrence_id = tocc.id
                 )
                 AND tocc.status IN ('pending', 'in_progress', 'completed')
-                ORDER BY tocc.scheduled_date DESC
+                ORDER BY 
+                    CASE 
+                        WHEN tocc.status IN ('pending', 'in_progress') THEN 0 
+                        ELSE 1 
+                    END,
+                    tocc.scheduled_date DESC
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
@@ -381,6 +393,59 @@ class Task:
                         task[key] = task[key].isoformat()
 
             return tasks
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_inventory_by_property(self, property_id):
+        """Get all inventory items for a specific property"""
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            query = """
+                SELECT id, name, category, quantity as current_quantity, unit, located_at
+                FROM inventory
+                WHERE property_id = %s
+                ORDER BY name
+            """
+            cursor.execute(query, (property_id,))
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def search_inventory_by_keyword(self, client_id, search_term):
+        """Search inventory items across all properties for a client by keyword matching"""
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            # Split search term into individual words for multi-word matching
+            words = search_term.strip().split()
+            
+            # Build conditions: each word must match name, category, or located_at
+            conditions = []
+            params = []
+            for word in words:
+                like_pattern = f"%{word}%"
+                conditions.append(
+                    "(i.name LIKE %s OR i.category LIKE %s OR i.located_at LIKE %s OR p.name LIKE %s)"
+                )
+                params.extend([like_pattern, like_pattern, like_pattern, like_pattern])
+            
+            where_clause = " AND ".join(conditions)
+            
+            query = f"""
+                SELECT i.id, i.name, i.category, i.quantity as current_quantity, 
+                       i.unit, i.located_at, i.property_id,
+                       p.name as property_name
+                FROM inventory i
+                JOIN properties p ON i.property_id = p.id
+                WHERE p.client_id = %s AND ({where_clause})
+                ORDER BY p.name, i.name
+            """
+            params.insert(0, client_id)
+            cursor.execute(query, params)
+            return cursor.fetchall()
         finally:
             cursor.close()
             conn.close()
@@ -494,3 +559,324 @@ class Task:
         finally:
             cursor.close()
             conn.close()  
+
+
+    def get_recurring_tasks_due_for_reminder(self):
+        """Get recurring tasks that need reminders based on their schedule"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get all recurring tasks
+            query = """
+                SELECT 
+                    td.id,
+                    td.title,
+                    td.description,
+                    td.assigned_to,
+                    ts.schedule_type as recurrence,
+                    ts.start_date,
+                    ts.recurrence_rule,
+                    tm.phone,
+                    tm.name as team_member_name,
+                    p.name as property_name
+                FROM task_definitions td
+                JOIN task_schedules ts ON td.id = ts.task_definition_id
+                JOIN team_members tm ON td.assigned_to = tm.id
+                LEFT JOIN properties p ON td.property_id = p.id
+                WHERE td.is_archived = 0
+                AND ts.schedule_type IS NOT NULL
+            """
+            cursor.execute(query)
+            tasks = cursor.fetchall()
+            
+            # Filter tasks that need reminders today
+            today = datetime.now().date()
+            tasks_due = []
+            
+            for task in tasks:
+                start_date = task['start_date']
+                if isinstance(start_date, datetime):
+                    start_date = start_date.date()
+                
+                recurrence = task['recurrence']
+                
+                # Simple logic to determine if task needs reminder today
+                # You can enhance this based on your recurrence rules
+                needs_reminder = False
+                
+                if recurrence == 'daily':
+                    # Daily tasks always need reminder
+                    needs_reminder = True
+                elif recurrence == 'weekly':
+                    # Check if it's the same day of week as start_date
+                    if today.weekday() == start_date.weekday():
+                        needs_reminder = True
+                elif recurrence == 'monthly':
+                    # Check if it's the same day of month as start_date
+                    if today.day == start_date.day:
+                        needs_reminder = True
+                
+                if needs_reminder:
+                    tasks_due.append(task)
+            
+            cursor.close()
+            conn.close()
+            return tasks_due
+            
+        except Exception as e:
+            print(f"Error getting recurring tasks for reminder: {e}")
+            import traceback
+            traceback.print_exc()
+            return []     
+
+
+    def update_task_reminder(self, task_id, user_id):
+        """Update task reminder tracking after sending reminder"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Check if there's a task_reminders table, if not, create one or just log
+            # For now, we'll just log and return success
+            query = """
+                INSERT INTO task_reminder_logs 
+                (task_definition_id, team_member_id, sent_at, reminder_type)
+                VALUES (%s, %s, NOW(), 'recurring')
+            """
+            cursor.execute(query, (task_id, user_id))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error updating task reminder: {e}")
+            # If table doesn't exist, just log and return True to avoid breaking
+            return True       
+
+    def search_tasks_by_keyword(self, user_id, search_term):
+        """Search task occurrences by keyword in title/description/property name."""
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            words = search_term.strip().split()
+            conditions = []
+            params = [user_id]
+
+            for word in words:
+                like_pattern = f"%{word}%"
+                conditions.append(
+                    "(td.title LIKE %s OR td.description LIKE %s OR p.name LIKE %s)"
+                )
+                params.extend([like_pattern, like_pattern, like_pattern])
+
+            where_clause = " AND ".join(conditions)
+
+            query = f"""
+                SELECT 
+                    tocc.id as task_occurrence_id,
+                    td.title, td.description, td.requires_photo,
+                    td.allows_inventory_update,
+                    tocc.status, tocc.scheduled_date, tocc.completed_at,
+                    p.name as property_name,
+                    tm.name as assigned_to_name,
+                    tocc.assigned_to
+                FROM task_occurrences tocc
+                JOIN task_definitions td ON tocc.task_definition_id = td.id
+                LEFT JOIN properties p ON td.property_id = p.id
+                LEFT JOIN team_members tm ON tocc.assigned_to = tm.id
+                WHERE tocc.assigned_to = %s
+                  AND tocc.status != 'deleted'
+                  AND ({where_clause})
+                ORDER BY 
+                    CASE 
+                        WHEN tocc.status IN ('pending', 'in_progress') THEN 0 
+                        ELSE 1 
+                    END,
+                    tocc.scheduled_date DESC
+                LIMIT 10
+            """
+            cursor.execute(query, params)
+            tasks = cursor.fetchall()
+
+            for task in tasks:
+                for key in task:
+                    if isinstance(task[key], datetime):
+                        task[key] = task[key].isoformat()
+                task['id'] = task['task_occurrence_id']
+                task['display_date'] = task.get('scheduled_date')
+                task['is_photo_required'] = task['requires_photo']
+
+            return tasks
+        finally:
+            cursor.close()
+            conn.close()
+
+    def search_properties_by_keyword(self, client_id, search_term):
+        """Search properties by keyword in name/address."""
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            words = search_term.strip().split()
+            conditions = []
+            params = [client_id]
+
+            for word in words:
+                like_pattern = f"%{word}%"
+                conditions.append("(p.name LIKE %s OR p.address LIKE %s)")
+                params.extend([like_pattern, like_pattern])
+
+            where_clause = " AND ".join(conditions)
+
+            query = f"""
+                SELECT p.id, p.name, p.address, p.google_map_link,
+                       (SELECT COUNT(*) FROM task_definitions td 
+                        WHERE td.property_id = p.id) as total_tasks,
+                       (SELECT COUNT(*) FROM inventory i 
+                        WHERE i.property_id = p.id) as total_inventory
+                FROM properties p
+                WHERE p.client_id = %s AND ({where_clause})
+                ORDER BY p.name
+                LIMIT 10
+            """
+            cursor.execute(query, params)
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_clients_for_phone(self, phone_number):
+        """Get all clients that have a team member with this phone number."""
+        import re
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            digits = re.sub(r'\D', '', phone_number.replace('whatsapp:', ''))
+            last_10 = digits[-10:] if len(digits) >= 10 else digits
+
+            query = """
+                SELECT DISTINCT c.id, c.name
+                FROM clients c
+                JOIN team_members tm ON tm.client_id = c.id
+                WHERE tm.phone LIKE %s AND tm.status = 'active'
+                ORDER BY c.name
+            """
+            cursor.execute(query, (f'%{last_10}',))
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def search_clients_by_keyword(self, search_term, phone_number=None):
+        """Search clients by name (fuzzy match), filtered to team member's clients if phone provided."""
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            like_term = f"%{search_term}%"
+
+            if phone_number:
+                import re
+                digits = re.sub(r'\D', '', phone_number.replace('whatsapp:', ''))
+                last_10 = digits[-10:] if len(digits) >= 10 else digits
+
+                query = """
+                    SELECT DISTINCT c.id, c.name
+                    FROM clients c
+                    JOIN team_members tm ON tm.client_id = c.id
+                    WHERE c.name LIKE %s
+                      AND tm.phone LIKE %s
+                      AND tm.status = 'active'
+                    ORDER BY c.name
+                    LIMIT 5
+                """
+                cursor.execute(query, (like_term, f'%{last_10}'))
+            else:
+                query = """
+                    SELECT id, name
+                    FROM clients 
+                    WHERE name LIKE %s
+                    ORDER BY name
+                    LIMIT 5
+                """
+                cursor.execute(query, (like_term,))
+
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_client_by_id(self, client_id):
+        """Get a single client by ID."""
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT id, name FROM clients WHERE id = %s", (client_id,))
+            return cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def ensure_search_history_table(self):
+        """Create search_history table if it doesn't exist."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS search_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    team_member_id INT NOT NULL,
+                    search_term VARCHAR(255) NOT NULL,
+                    search_scope VARCHAR(20) DEFAULT 'all',
+                    result_count INT DEFAULT 0,
+                    searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_member_search (team_member_id, searched_at DESC)
+                )
+            """)
+            conn.commit()
+            print("✅ search_history table ensured")
+        except Exception as e:
+            print(f"⚠️ Error creating search_history table: {e}")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def save_search_history(self, team_member_id, search_term, scope='all', result_count=0):
+        """Save a search to history."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO search_history 
+                (team_member_id, search_term, search_scope, result_count)
+                VALUES (%s, %s, %s, %s)
+            """, (team_member_id, search_term, scope, result_count))
+            conn.commit()
+        except Exception as e:
+            print(f"⚠️ Error saving search history: {e}")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_recent_searches(self, team_member_id, limit=5):
+        """Get recent unique searches for a user."""
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            query = """
+                SELECT search_term, search_scope, result_count,
+                       MAX(searched_at) as last_searched
+                FROM search_history
+                WHERE team_member_id = %s
+                GROUP BY search_term, search_scope, result_count
+                ORDER BY last_searched DESC
+                LIMIT %s
+            """
+            cursor.execute(query, (team_member_id, limit))
+            return cursor.fetchall()
+        except Exception as e:
+            print(f"⚠️ Error getting search history: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()

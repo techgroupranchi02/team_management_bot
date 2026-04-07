@@ -102,6 +102,14 @@ def whatsapp_webhook():
                             clean_phone = from_number.replace('whatsapp:', '')
                             member = task_service.team_member_model.find_by_phone(clean_phone)
                             
+                            # Check if user has an active client preference (from client switching)
+                            if member:
+                                active_cid = task_service.user_active_client.get(clean_phone)
+                                if active_cid and member.get('client_id') != active_cid:
+                                    switched = task_service.team_member_model.find_by_phone_and_client(clean_phone, active_cid)
+                                    if switched:
+                                        member = switched
+                            
                             logger.info(f"📨 Message type: {message_type} from: {from_number} (Contact: {contact_name})")
                             
                             try:
@@ -126,6 +134,16 @@ def whatsapp_webhook():
                                     # Process image upload with caption (if any)
                                     task_service.handle_message(f"whatsapp:{from_number}", caption or "", media_id)
                                 
+                                elif message_type == 'audio':
+                                    # Handle voice messages
+                                    audio_data = message.get('audio', {})
+                                    media_id = audio_data.get('id', '')
+                                    
+                                    logger.info(f"🎙️ Voice message, Media ID: {media_id}")
+                                    
+                                    # Process voice message - transcribe and handle
+                                    task_service.handle_voice_message(f"whatsapp:{from_number}", media_id)
+                                
                                 elif message_type == 'interactive':
                                     # Handle interactive messages
                                     interactive_data = message.get('interactive', {})
@@ -138,7 +156,7 @@ def whatsapp_webhook():
                                             title = button_reply.get('title', '')
                                             logger.info(f"🔄 Button click: {button_id} - {title}")
                                             # Send the button title as the message
-                                            task_service.handle_message(f"whatsapp:{from_number}", title, None)
+                                            task_service.handle_message(f"whatsapp:{from_number}", title, None, button_id=button_id)
                                     
                                     elif interactive_type == 'list_reply':
                                         list_reply = interactive_data.get('list_reply', {})
@@ -163,21 +181,46 @@ def whatsapp_webhook():
                                                     # Handle language change
                                                     task_service.handle_language_change(member, f"whatsapp:{from_number}", 'en')
                                                 elif list_id.startswith('lang_'):
-                                                    # Language selection
-                                                    if list_id == "lang_en":
-                                                        task_service.save_language_preference(f"whatsapp:{from_number}", 'en', 'English')
-                                                    elif list_id == "lang_hi":
-                                                        task_service.save_language_preference(f"whatsapp:{from_number}", 'hi', 'Hindi')
-                                                    elif list_id == "lang_es":
-                                                        task_service.save_language_preference(f"whatsapp:{from_number}", 'es', 'Spanish')
+                                                    # Dynamic language selection - extract code from ID
+                                                    lang_code = list_id.replace('lang_', '')
+                                                    lang_name = list_title  # Use the title from the list selection
+                                                    logger.info(f"🌐 Language selected: {lang_code} - {lang_name}")
+                                                    task_service.save_language_preference(f"whatsapp:{from_number}", lang_code, lang_name)
                                                 elif list_id == "back_settings":
                                                     # Return to settings
                                                     task_service.show_settings_menu(member, f"whatsapp:{from_number}", 'en')
+                                                elif list_id == "client_change":
+                                                    # Show client selection menu (from Settings)
+                                                    task_service.show_client_selection_menu(member, f"whatsapp:{from_number}", 'en')
+                                                elif list_id.startswith('switch_client_'):
+                                                    # Client selection from client list
+                                                    client_id = list_id.replace('switch_client_', '')
+                                                    logger.info(f"🏢 Client selected: ID={client_id}, Name={list_title}")
+                                                    user_language = getattr(task_service, '_get_user_language', lambda phone, text: 'en')(f"whatsapp:{from_number}", '')
+                                                    # Lookup client by ID directly (not by name, which can be truncated)
+                                                    try:
+                                                        matched_client = task_service.task_model.get_client_by_id(int(client_id))
+                                                        if not matched_client:
+                                                            matched_client = {'id': int(client_id), 'name': list_title}
+                                                        task_service._do_client_switch(member, f"whatsapp:{from_number}", matched_client, user_language)
+                                                    except Exception as e:
+                                                        logger.error(f"Error switching client: {e}")
+                                                        import traceback
+                                                        traceback.print_exc()
+                                                        task_service.whatsapp_service.send_message(f"whatsapp:{from_number}", "❌ Failed to switch client. Please try again.", 'en')
                                                 elif list_id.startswith('property_'):
                                                     # Property selection from property list
                                                     property_id = list_id.replace('property_', '')
                                                     logger.info(f"🎯 Property selected: ID={property_id}, Name={list_title}")
                                                     task_service.handle_property_selection_result(f"whatsapp:{from_number}", property_id, list_title)
+                                                elif list_id.startswith('inv_prop_'):
+                                                    property_id = list_id.replace('inv_prop_', '')
+                                                    logger.info(f"📦 Inventory Property selected: ID={property_id}, Name={list_title}")
+                                                    
+                                                    # We need user_language inside app.py... 
+                                                    # Let's just use task_service.handle_property_inventory_selection
+                                                    user_language = getattr(task_service, '_get_user_language', lambda phone, text: 'en')(f"whatsapp:{from_number}", '')
+                                                    task_service.handle_property_inventory_selection(member, f"whatsapp:{from_number}", property_id, user_language)
                                                 else:
                                                     # Send list title as regular message
                                                     task_service.handle_message(f"whatsapp:{from_number}", list_title, None)
