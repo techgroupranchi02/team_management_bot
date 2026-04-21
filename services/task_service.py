@@ -1,43 +1,78 @@
-from email.mime import message
 from models.team_member import TeamMember
 from models.task import Task
 from services.whatsapp_service import WhatsAppService
 from services.image_service import ImageService
 from services.language_service import LanguageService
+from utils.helpers import normalize_phone
 import os
 import json
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Context expiry timeout in seconds (30 minutes)
+CONTEXT_TTL_SECONDS = 1800
 
 
 class TaskService:
-    def __init__(self, db_config):
+    def __init__(self, db_config, bot_session=None, analytics=None):
         self.db_config = db_config
         self.team_member_model = TeamMember(db_config)
         self.task_model = Task(db_config)
         self.whatsapp_service = WhatsAppService()
         self.image_service = ImageService()
         self.language_service = LanguageService()
-        self.user_languages = {}  # Store user language preferences
-        self.user_property_selections = {}  # Store user property selections
-        self.user_active_client = {}  # Store active client_id per phone (for client switching)
+        self.user_languages = {}  # In-memory cache (warm from DB on access)
+        self.user_property_selections = {}  # In-memory cache
+        self.user_active_client = {}  # In-memory cache (backed by bot_sessions DB)
+        self.bot_session = bot_session  # Persistent session store
+        self.analytics = analytics  # Analytics logger
 
+        # Warm active_client cache from DB
+        self._warm_active_clients()
 
         # Check database structure on initialization
-        print("🔍 Checking database structure...")
+        logger.info("Checking database structure...")
         self.check_database_structure()
         self.task_model.ensure_search_history_table()
+
+    # ── active client persistence (4.1) ────────────────────
+    def _warm_active_clients(self):
+        """Load active_client preferences from DB into in-memory cache on startup."""
+        if not self.bot_session:
+            return
+        # Will be warmed lazily on first access per user
+        pass
+
+    def get_active_client(self, phone):
+        """Get active client_id for phone (cache-through to DB)."""
+        nphone = normalize_phone(phone)
+        if nphone in self.user_active_client:
+            return self.user_active_client[nphone]
+        if self.bot_session:
+            cid = self.bot_session.get_active_client(nphone)
+            if cid:
+                self.user_active_client[nphone] = cid
+            return cid
+        return None
+
+    def set_active_client(self, phone, client_id):
+        """Set active client_id (memory + DB)."""
+        nphone = normalize_phone(phone)
+        self.user_active_client[nphone] = client_id
+        if self.bot_session:
+            self.bot_session.set_active_client(nphone, client_id)
 
     def get_connection(self):
         """Get database connection"""
         return self.task_model.get_connection()    
 
     def handle_message(self, phone_number, message, media_url=None, button_id=None):
-        # Clean phone number (remove 'whatsapp:' prefix if present)
-        clean_phone = phone_number.replace('whatsapp:', '')
+        clean_phone = normalize_phone(phone_number)
         
-        print(f"🔍 Looking up team member with phone: {clean_phone}")
-        print(f"🔍 Received message: '{message}'")
+        logger.debug(f"Looking up team member with phone: {clean_phone}")
         
-        print(f"🔍 Looking up team member with phone: {clean_phone}")
         member = self.team_member_model.find_by_phone(clean_phone)
         
         if not member:
@@ -54,19 +89,27 @@ class TaskService:
             self.whatsapp_service.send_message(clean_phone, no_access_msg, detected_lang)
             return
 
+        # If user has no active client preference, check for multiple client matches
+        if not self.get_active_client(clean_phone):
+            all_members = self.team_member_model.find_all_by_phone(clean_phone)
+            unique_clients = {m['client_id'] for m in all_members}
+            if len(unique_clients) > 1:
+                user_language = self._get_user_language(clean_phone, message or '')
+                self.show_client_selection_menu(member, clean_phone, user_language)
+                return
+
         # Check if user has an active client preference (from client switching)
-        active_client_id = self.user_active_client.get(clean_phone)
+        active_client_id = self.get_active_client(clean_phone)
         if active_client_id and member.get('client_id') != active_client_id:
-            # Re-find the member record for the preferred client
             switched_member = self.team_member_model.find_by_phone_and_client(clean_phone, active_client_id)
             if switched_member:
                 member = switched_member
-                print(f"🔄 Using switched client context: client_id={active_client_id}")
+                logger.debug(f"Using switched client context: client_id={active_client_id}")
 
-        print(f"✅ Found team member: {member['name']} (ID: {member['id']}, client_id: {member.get('client_id')})")
+        logger.info(f" Found team member: {member['name']} (ID: {member['id']}, client_id: {member.get('client_id')})")
         
-        # Get user language
-        user_language = self._get_user_language(clean_phone, message)
+        # Get user language (pass member_id to avoid redundant DB lookup)
+        user_language = self._get_user_language(clean_phone, message, member_id=member['id'])
 
         # FIRST: Check if this is an inventory update text message
         if message and not media_url:
@@ -78,7 +121,7 @@ class TaskService:
         if button_id:
             if button_id.startswith('inv_item_'):
                 item_id = button_id.replace('inv_item_', '')
-                print(f"📦 Inventory item selected via button: ID={item_id}")
+                logger.info(f" Inventory item selected via button: ID={item_id}")
                 self.handle_inventory_item_selected(member, clean_phone, item_id, user_language)
                 return
             if button_id.startswith('inv_search_next_'):
@@ -109,7 +152,7 @@ class TaskService:
         # ─── End: Direct Search & Slash Commands ───
 
         # Handle button clicks by exact title match FIRST
-        print(f"🔘 Processing button click: '{message}'")
+        logger.debug(f" Processing button click: '{message}'")
         
         # Check for task selection buttons like "#1: Clean Room 101"
         if message.startswith('#') and ':' in message:
@@ -195,7 +238,7 @@ class TaskService:
         
         # Check if message is a button ID
         if target_id in button_id_mappings:
-            print(f"✅ Button matched by ID: {target_id}")
+            logger.info(f" Button matched by ID: {target_id}")
             button_id_mappings[target_id]()
             return
         
@@ -231,14 +274,14 @@ class TaskService:
         
         # Check for mark_complete button IDs (like "mark_complete_123")
         if target_id.startswith('mark_complete_'):
-            print(f"🔍 DEBUG: Received mark_complete button ID: {target_id}")
+            logger.debug(f" DEBUG: Received mark_complete button ID: {target_id}")
             self.handle_mark_complete_from_button_id(member, clean_phone, target_id, user_language)
             return
 
         # Check for update_status button IDs (like "update_status_123") 
         if target_id.startswith('update_status_'):
             task_id = target_id.replace('update_status_', '')
-            print(f"🔍 DEBUG: Received update_status button ID for task: {task_id}")
+            logger.debug(f" DEBUG: Received update_status button ID for task: {task_id}")
             # Store the task_id in user context
             self._store_user_context(clean_phone, {'current_task_id': task_id})
             self.show_status_options(member, clean_phone, task_id, user_language)
@@ -247,14 +290,14 @@ class TaskService:
         # Check for inv_prop_ button IDs (inventory property selection)
         if target_id.startswith('inv_prop_'):
             property_id = target_id.replace('inv_prop_', '')
-            print(f"📦 Inventory property selected via button: ID={property_id}")
+            logger.info(f" Inventory property selected via button: ID={property_id}")
             self.handle_property_inventory_selection(member, clean_phone, property_id, user_language)
             return
 
         # Check for inv_item_ button IDs (inventory item selection from search)
         if target_id.startswith('inv_item_'):
             item_id = target_id.replace('inv_item_', '')
-            print(f"📦 Inventory item selected via button: ID={item_id}")
+            logger.info(f" Inventory item selected via button: ID={item_id}")
             self.handle_inventory_item_selected(member, clean_phone, item_id, user_language)
             return
 
@@ -277,7 +320,8 @@ class TaskService:
         # Check for switch_client_ button IDs (client switching from /client or Settings)
         if target_id.startswith('switch_client_'):
             client_id_str = target_id.replace('switch_client_', '')
-            print(f"🏢 Client switch button: ID={client_id_str}")
+            logger.info(f" Client switch button: ID={client_id_str}")
+            conn = None
             try:
                 client_id = int(client_id_str)
                 # Look up client name
@@ -285,21 +329,25 @@ class TaskService:
                 cursor = conn.cursor(dictionary=True)
                 cursor.execute("SELECT id, name FROM clients WHERE id = %s", (client_id,))
                 client = cursor.fetchone()
-                cursor.close()
-                conn.close()
                 if client:
                     self._do_client_switch(member, clean_phone, client, user_language)
                 else:
                     self.whatsapp_service.send_message(clean_phone, "❌ Client not found.", user_language)
             except Exception as e:
-                print(f"❌ Error switching client from button: {e}")
+                logger.error(f" Error switching client from button: {e}")
                 self.whatsapp_service.send_message(clean_phone, "❌ Error switching client.", user_language)
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             return
 
         # Check for skip_inventory button IDs (like "skip_inventory_123")
         if target_id.startswith('skip_inventory_'):
             task_id = target_id.replace('skip_inventory_', '')
-            print(f"🔍 DEBUG: Received skip_inventory button ID for task: {task_id}")
+            logger.debug(f" DEBUG: Received skip_inventory button ID for task: {task_id}")
             self.handle_skip_inventory(member, clean_phone, task_id, user_language)
             return
             
@@ -321,7 +369,7 @@ class TaskService:
             
         # Fallback: Check if message matches any button title
         if message in button_mappings:
-            print(f"✅ Fallback button matched by title: {message}")
+            logger.info(f" Fallback button matched by title: {message}")
             button_mappings[message]()
             return
         
@@ -335,10 +383,10 @@ class TaskService:
                 # Ask LanguageService to translate the inbound message from `user_language` -> English
                 translated_msg = self.language_service.translate_text(message_text, "en")
                 if translated_msg:
-                    print(f"🔄 Translated inbound message: '{message_text}' -> '{translated_msg}'")
+                    logger.info(f" Translated inbound message: '{message_text}' -> '{translated_msg}'")
                     message_text = translated_msg.strip().lower()
             except Exception as e:
-                print(f"Error translating inbound message to English: {e}")
+                logger.error(f"Error translating inbound message to English: {e}")
         
         if message_text in ['hi', 'hello', 'hii', 'hey', 'नमस्ते', 'hola', 'bonjour', 'greetings', 'welcome']:
             self.show_main_menu(member, clean_phone, user_language)
@@ -369,7 +417,7 @@ class TaskService:
         import requests as req
         
         clean_phone = phone_number.replace('whatsapp:', '')
-        print(f"🎙️ Processing voice message from {clean_phone}, media_id: {media_id}")
+        logger.info(f" Processing voice message from {clean_phone}, media_id: {media_id}")
         
         member = self.team_member_model.find_by_phone(clean_phone)
         if not member:
@@ -388,7 +436,7 @@ class TaskService:
             
             media_response = req.get(media_info_url, headers=headers)
             if media_response.status_code != 200:
-                print(f"❌ Failed to get media info: {media_response.status_code}")
+                logger.error(f" Failed to get media info: {media_response.status_code}")
                 self.whatsapp_service.send_message(clean_phone, "❌ Failed to process voice message.", 'en')
                 return
             
@@ -397,13 +445,13 @@ class TaskService:
             mime_type = media_info.get('mime_type', 'audio/ogg')
             
             if not download_url:
-                print(f"❌ No download URL in media response")
+                logger.error(f" No download URL in media response")
                 return
             
             # Download the actual audio file
             audio_response = req.get(download_url, headers=headers)
             if audio_response.status_code != 200:
-                print(f"❌ Failed to download audio: {audio_response.status_code}")
+                logger.error(f" Failed to download audio: {audio_response.status_code}")
                 return
             
             # Determine extension from mime type
@@ -423,20 +471,34 @@ class TaskService:
                 tmp_file.write(audio_response.content)
                 audio_file_path = tmp_file.name
             
-            print(f"🎙️ Audio saved to: {audio_file_path} ({len(audio_response.content)} bytes)")
+            logger.info(f" Audio saved to: {audio_file_path} ({len(audio_response.content)} bytes)")
             
             # Step 2: Transcribe using Groq Whisper
             result = self.language_service.translation_service.transcribe_audio(audio_file_path)
             transcribed_text = result.get('text', '').strip()
             detected_language = result.get('language', 'en')
             
-            print(f"🎙️ Transcription result: '{transcribed_text}' (language: {detected_language})")
+            logger.info(f" Transcription result: '{transcribed_text}' (language: {detected_language})")
             
-            if not transcribed_text:
+            if not transcribed_text or len(transcribed_text.split()) < 1:
                 # Could not transcribe - notify user
                 user_lang = self._get_user_language(clean_phone, '')
-                error_msg = self.whatsapp_service._get_translated_message('unknown_command', user_lang)
-                self.whatsapp_service.send_message(clean_phone, f"🎙️ {error_msg}", user_lang)
+                self.whatsapp_service.send_message(
+                    clean_phone,
+                    "🎙️ I couldn't understand your voice message. Please try again or type your request.",
+                    user_lang
+                )
+                return
+            
+            # Basic coherence check: reject very short single-char gibberish
+            cleaned_words = [w for w in transcribed_text.split() if len(w) > 1 or w.isalpha()]
+            if not cleaned_words:
+                user_lang = self._get_user_language(clean_phone, '')
+                self.whatsapp_service.send_message(
+                    clean_phone,
+                    "🎙️ I couldn't understand your voice message. Please try again or type your request.",
+                    user_lang
+                )
                 return
             
             # Step 3: Update user's language preference based on voice
@@ -444,20 +506,18 @@ class TaskService:
             self.save_user_preferences(clean_phone, {'preferred_language': detected_language})
             
             # Step 4: Process as a regular text message
-            print(f"🎙️ Routing transcribed text to handle_message: '{transcribed_text}'")
+            logger.info(f" Routing transcribed text to handle_message: '{transcribed_text}'")
             self.handle_message(clean_phone, transcribed_text)
             
         except Exception as e:
-            print(f"❌ Error processing voice message: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error processing voice message: {e}")
             self.whatsapp_service.send_message(clean_phone, "❌ Failed to process voice message.", 'en')
         finally:
             # Clean up temp file
             if audio_file_path and os.path.exists(audio_file_path):
                 try:
                     os.remove(audio_file_path)
-                    print(f"🗑️ Cleaned up temp audio file: {audio_file_path}")
+                    logger.debug(f" Cleaned up temp audio file: {audio_file_path}")
                 except Exception:
                     pass
 
@@ -660,7 +720,7 @@ class TaskService:
                 info_message = f"Property information not found for ID: {current_property_id}"
             
         except Exception as e:
-            print(f"Error getting property info: {e}")
+            logger.error(f"Error getting property info: {e}")
             info_message = f"🏠 *Current Property*\n\n{property_name}"
         
         # Add action buttons
@@ -692,7 +752,7 @@ class TaskService:
 
     def handle_property_selection_result(self, phone_number, property_id, property_name):
         """Handle property selection from interactive list and save to DB"""
-        print(f"🎯 Property selection: phone={phone_number}, property_id={property_id}, property_name={property_name}")
+        logger.info(f" Property selection: phone={phone_number}, property_id={property_id}, property_name={property_name}")
         
         # Get member to verify property exists
         member = self.team_member_model.find_by_phone(phone_number.replace('whatsapp:', ''))
@@ -706,7 +766,7 @@ class TaskService:
                     break
             
             if not actual_property:
-                print(f"❌ Property ID {property_id} not found for user {member['id']}")
+                logger.error(f" Property ID {property_id} not found for user {member['id']}")
                 error_msg = f"Property not found. Please select a valid property."
                 self.whatsapp_service.send_message(phone_number, error_msg, 'en')
                 return
@@ -727,9 +787,9 @@ class TaskService:
             })
             
             if success:
-                print(f"✅ Property '{property_name}' (ID: {property_id}) saved to database for {phone_number}")
+                logger.info(f" Property '{property_name}' (ID: {property_id}) saved to database for {phone_number}")
             else:
-                print(f"❌ Failed to save property to database for {phone_number}")
+                logger.error(f" Failed to save property to database for {phone_number}")
             
             # Get user language
             user_language = self.user_languages.get(phone_number, 'en')
@@ -764,7 +824,7 @@ class TaskService:
             
             self.whatsapp_service.send_message(phone_number, confirmation_message, user_language, buttons)
         else:
-            print(f"❌ Member not found for phone: {phone_number}")
+            logger.error(f" Member not found for phone: {phone_number}")
 
     def show_property_selection_menu(self, member, phone_number, language):
         """Show property selection menu (called from Settings)"""
@@ -883,9 +943,9 @@ class TaskService:
             cursor.execute(query, (client_id,))
             properties = cursor.fetchall()
             
-            print(f"📊 Found {len(properties)} properties for client_id {client_id}:")
+            logger.info(f" Found {len(properties)} properties for client_id {client_id}:")
             for prop in properties:
-                print(f"  - ID: {prop['id']}, Name: {prop['name']}")
+                logger.debug(f"  - ID: {prop['id']}, Name: {prop['name']}")
             
             cursor.close()
             conn.close()
@@ -893,15 +953,13 @@ class TaskService:
             return properties
             
         except Exception as e:
-            print(f"❌ Error getting user properties: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error getting user properties: {e}")
             return []
 
     def handle_mark_complete_button(self, member, phone_number, language):
         """Handle 'Mark Complete' button click when button title is sent instead of ID"""
-        print(f"🔍 DEBUG: handle_mark_complete_button called for {phone_number}")
-        print(f"🔍 DEBUG: Message received: Could be button title or ID")
+        logger.debug(f" DEBUG: handle_mark_complete_button called for {phone_number}")
+        logger.debug(f" DEBUG: Message received: Could be button title or ID")
         
         # Try multiple ways to get the task ID:
         
@@ -909,7 +967,7 @@ class TaskService:
         user_context = self._get_user_context(phone_number)
         if user_context and 'current_task_id' in user_context:
             task_id = user_context['current_task_id']
-            print(f"🔍 DEBUG: Found current_task_id in context: {task_id}")
+            logger.debug(f" DEBUG: Found current_task_id in context: {task_id}")
             self.mark_task_complete(member, phone_number, task_id, language)
             return
         
@@ -918,7 +976,7 @@ class TaskService:
         if hasattr(self, '_recent_task_views'):
             recent_task = self._recent_task_views.get(phone_number)
             if recent_task:
-                print(f"🔍 DEBUG: Found recent task view: {recent_task}")
+                logger.debug(f" DEBUG: Found recent task view: {recent_task}")
                 self.mark_task_complete(member, phone_number, recent_task, language)
                 return
         
@@ -926,7 +984,7 @@ class TaskService:
         tasks = self.task_model.get_tasks_by_user(member['id'])
         
         if not tasks:
-            print(f"🔍 DEBUG: No tasks found at all")
+            logger.debug(f" DEBUG: No tasks found at all")
             error_msg = "No tasks found. Please ask your administrator to assign tasks to you."
             self.whatsapp_service.send_message(phone_number, error_msg, language)
             return
@@ -936,13 +994,13 @@ class TaskService:
         
         if len(pending_tasks) == 1:
             task_id = pending_tasks[0]['id']
-            print(f"🔍 DEBUG: Only one pending task found, using task_id: {task_id}")
+            logger.debug(f" DEBUG: Only one pending task found, using task_id: {task_id}")
             self.mark_task_complete(member, phone_number, task_id, language)
             return
         
         # 5. Multiple pending tasks - ask user to select
         if pending_tasks:
-            print(f"🔍 DEBUG: {len(pending_tasks)} pending tasks found, showing selection")
+            logger.debug(f" DEBUG: {len(pending_tasks)} pending tasks found, showing selection")
             
             # Format task list with selection buttons
             task_list = self.whatsapp_service.format_task_list(pending_tasks, language)
@@ -973,48 +1031,33 @@ class TaskService:
             return
         
         # 6. No pending tasks
-        print(f"🔍 DEBUG: No pending tasks found")
+        logger.debug(f" DEBUG: No pending tasks found")
         no_pending_msg = "You don't have any pending tasks to mark as complete."
         buttons = self.whatsapp_service._create_welcome_buttons(language)
         self.whatsapp_service.send_message(phone_number, no_pending_msg, language, buttons)
 
     def handle_update_status_button(self, member, phone_number, language):
         """Handle 'Update Status' button click"""
-        print(f"🔍 DEBUG: handle_update_status_button called for {phone_number}")
-        print(f"🔍 DEBUG: Checking user context...")
+        logger.debug(f" DEBUG: handle_update_status_button called for {phone_number}")
+        logger.debug("handle_update_status_button: Checking user context...")
         
-        # Try multiple phone number formats to get context
-        user_context = None
-        clean_phone = phone_number.replace('whatsapp:', '')
+        user_context = self._get_user_context(phone_number)
         
-        # Check all possible formats
-        for phone_format in [phone_number, clean_phone, f"whatsapp:{clean_phone}"]:
-            user_context = self._get_user_context(phone_format)
-            if user_context:
-                print(f"🔍 DEBUG: Found context with format: {phone_format}")
-                break
-        
-        print(f"🔍 DEBUG: User context: {user_context}")
+        logger.debug(f"handle_update_status_button: User context: {user_context}")
         
         if user_context and 'current_task_id' in user_context:
             task_id = user_context['current_task_id']
-            print(f"🔍 DEBUG: Found current_task_id: {task_id}")
+            logger.debug(f"handle_update_status_button: Found current_task_id: {task_id}")
             
-            # Ensure context is stored for all formats
-            self._store_user_context(clean_phone, {'current_task_id': task_id})
-            self._store_user_context(phone_number, {'current_task_id': task_id})
-            self._store_user_context(f"whatsapp:{clean_phone}", {'current_task_id': task_id})
-            
-            print(f"🔍 DEBUG: Calling show_status_options with task_id: {task_id}")
             self.show_status_options(member, phone_number, task_id, language)
         else:
-            print(f"🔍 DEBUG: No current_task_id in context, checking for most recent task")
+            logger.debug("handle_update_status_button: No current_task_id in context")
             # Try to find the most recent task
             tasks = self.task_model.get_tasks_by_user(member['id'])
             if tasks:
                 task = tasks[0]
                 task_id = task['id']
-                print(f"🔍 DEBUG: Using most recent task ID: {task_id}")
+                logger.debug(f" DEBUG: Using most recent task ID: {task_id}")
                 
                 # Store task_id in context for all formats
                 self._store_user_context(clean_phone, {'current_task_id': task_id})
@@ -1023,7 +1066,7 @@ class TaskService:
                 
                 self.show_status_options(member, phone_number, task_id, language)
             else:
-                print(f"🔍 DEBUG: No tasks found, showing task list")
+                logger.debug(f" DEBUG: No tasks found, showing task list")
                 # Show task list to select from
                 self.handle_list_tasks(member, phone_number, language)
 
@@ -1060,9 +1103,22 @@ class TaskService:
             
             if 0 <= task_index < len(tasks):
                 task = tasks[task_index]
+                task_id = task['id']
+                
+                # Verify the task title still matches (guard against list reorder)
+                btn_title_part = button_title.split(':', 1)[1].strip() if ':' in button_title else ''
+                expected_title = task['title'][:12] + '...' if len(task['title']) > 12 else task['title']
+                if btn_title_part and not task['title'].startswith(btn_title_part.rstrip('.')):
+                    # Title mismatch - try to find by title substring
+                    for t in tasks:
+                        t_short = t['title'][:12] + '...' if len(t['title']) > 12 else t['title']
+                        if btn_title_part == t_short or t['title'].startswith(btn_title_part.rstrip('.')):
+                            task_id = t['id']
+                            break
+                
                 # Store current task in context
-                self._store_user_context(phone_number, {'current_task_id': task['id']})
-                self.show_task_options(member, phone_number, task['id'], language)
+                self._store_user_context(phone_number, {'current_task_id': task_id})
+                self.show_task_options(member, phone_number, task_id, language)
             else:
                 self.handle_unknown_command(member, phone_number, language)
         except (ValueError, IndexError):
@@ -1144,12 +1200,12 @@ class TaskService:
         try:
             # Extract task ID from button ID
             task_id = button_id.replace('mark_complete_', '')
-            print(f"🔍 DEBUG: Extracted task_id {task_id} from button_id {button_id}")
+            logger.debug(f" DEBUG: Extracted task_id {task_id} from button_id {button_id}")
             
             # Verify the task exists and belongs to the user
             task = self.task_model.get_task_by_id(task_id, member['id'])
             if not task:
-                print(f"🔍 DEBUG: Task {task_id} not found or doesn't belong to user")
+                logger.debug(f" DEBUG: Task {task_id} not found or doesn't belong to user")
                 error_msg = "Task not found or you don't have permission to update it."
                 self.whatsapp_service.send_message(phone_number, error_msg, language)
                 return
@@ -1161,7 +1217,7 @@ class TaskService:
             self.mark_task_complete(member, phone_number, task_id, language)
             
         except Exception as e:
-            print(f"❌ Error handling mark complete from button ID: {e}")
+            logger.error(f" Error handling mark complete from button ID: {e}")
             error_msg = "Unable to mark task as complete. Please try again."
             self.whatsapp_service.send_message(phone_number, error_msg, language)
 
@@ -1207,16 +1263,19 @@ class TaskService:
         
         self.whatsapp_service.send_message(phone_number, message, language, buttons)
 
-    def save_user_preferences(self, phone_number, preferences):
+    def save_user_preferences(self, phone_number, preferences, member_id=None):
         """Save user preferences to database"""
+        conn = None
         try:
+            # Use provided member_id or look up
+            if not member_id:
+                member = self.team_member_model.find_by_phone(phone_number.replace('whatsapp:', ''))
+                if not member:
+                    return False
+                member_id = member['id']
+            
             conn = self.get_connection()
             cursor = conn.cursor()
-            
-            # Get team member ID
-            member = self.team_member_model.find_by_phone(phone_number.replace('whatsapp:', ''))
-            if not member:
-                return False
             
             # Build update query based on provided preferences
             updates = []
@@ -1232,14 +1291,10 @@ class TaskService:
                     property_id = int(preferences['last_selected_property_id'])
                     updates.append("last_selected_property_id = %s")
                     values.append(property_id)
-                    print(f"💾 Saving property_id: {property_id} for user: {member['id']}")
+                    logger.debug(f" Saving property_id: {property_id} for user: {member_id}")
                 except (ValueError, TypeError) as e:
-                    print(f"❌ Invalid property_id: {preferences['last_selected_property_id']}, Error: {e}")
+                    logger.error(f" Invalid property_id: {preferences['last_selected_property_id']}, Error: {e}")
                     # Don't save invalid property_id
-            
-            # if 'notification_preferences' in preferences:
-            #     updates.append("notification_preferences = %s")
-            #     values.append(json.dumps(preferences['notification_preferences']))
             
             updates.append("settings_updated_at = CURRENT_TIMESTAMP")
             
@@ -1249,32 +1304,29 @@ class TaskService:
                     SET {', '.join(updates)} 
                     WHERE id = %s
                 """
-                values.append(member['id'])
-                
-                print(f"📝 Executing query: {query}")
-                print(f"📝 With values: {values}")
+                values.append(member_id)
                 
                 cursor.execute(query, values)
                 conn.commit()
                 
-                print(f"✅ Preferences saved successfully for user ID: {member['id']}")
-                
-                cursor.close()
-                conn.close()
+                logger.info(f" Preferences saved successfully for user ID: {member_id}")
                 return True
             
-            cursor.close()
-            conn.close()
             return False
             
         except Exception as e:
-            print(f"❌ Error saving user preferences: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error saving user preferences: {e}")
             return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         
     def check_database_structure(self):
         """Check if the required columns exist in the database"""
+        conn = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor(dictionary=True)
@@ -1289,29 +1341,35 @@ class TaskService:
             """)
             
             columns = cursor.fetchall()
-            print("📊 Database columns found:")
+            logger.info("📊 Database columns found:")
             for col in columns:
-                print(f"  - {col['COLUMN_NAME']}: {col['DATA_TYPE']} (Nullable: {col['IS_NULLABLE']})")
-            
-            cursor.close()
-            conn.close()
+                logger.info(f"  - {col['COLUMN_NAME']}: {col['DATA_TYPE']} (Nullable: {col['IS_NULLABLE']})")
             
             return columns
             
         except Exception as e:
-            print(f"❌ Error checking database structure: {e}")
-            return None    
+            logger.error(f" Error checking database structure: {e}")
+            return None
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     
-    def get_user_preferences(self, phone_number):
+    def get_user_preferences(self, phone_number, member_id=None):
         """Get user preferences from database"""
+        conn = None
         try:
+            # Use provided member_id or look up
+            if not member_id:
+                member = self.team_member_model.find_by_phone(phone_number.replace('whatsapp:', ''))
+                if not member:
+                    return None
+                member_id = member['id']
+            
             conn = self.get_connection()
             cursor = conn.cursor(dictionary=True)
-            
-            # Get team member ID
-            member = self.team_member_model.find_by_phone(phone_number.replace('whatsapp:', ''))
-            if not member:
-                return None
             
             query = """
                 SELECT 
@@ -1321,33 +1379,29 @@ class TaskService:
                 FROM team_members 
                 WHERE id = %s
             """
-            cursor.execute(query, (member['id'],))
+            cursor.execute(query, (member_id,))
             preferences = cursor.fetchone()
-            
-            cursor.close()
-            conn.close()
-            
-            # # Parse JSON if exists
-            # if preferences and preferences.get('notification_preferences'):
-            #     try:
-            #         preferences['notification_preferences'] = json.loads(preferences['notification_preferences'])
-            #     except:
-            #         preferences['notification_preferences'] = {}
             
             return preferences
             
         except Exception as e:
-            print(f"Error getting user preferences: {e}")
+            logger.error(f"Error getting user preferences: {e}")
             return None
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     
-    def _get_user_language(self, phone_number, message):
+    def _get_user_language(self, phone_number, message, member_id=None):
         """Get user's language preference from DB/cache. Language only changes via Settings menu."""
         # Check in-memory cache first
         if phone_number in self.user_languages:
             return self.user_languages[phone_number]
             
-        # Fallback to database
-        preferences = self.get_user_preferences(phone_number)
+        # Fallback to database (pass member_id to avoid redundant lookup)
+        preferences = self.get_user_preferences(phone_number, member_id=member_id)
         if preferences and preferences.get('preferred_language'):
             db_language = preferences['preferred_language']
             self.user_languages[phone_number] = db_language
@@ -1465,7 +1519,7 @@ class TaskService:
 
     def handle_button_action(self, member, phone_number, button_id, language):
         """Handle button click actions"""
-        print(f"🔘 Button clicked: {button_id}")
+        logger.debug(f" Button clicked: {button_id}")
         
         if button_id.startswith('task_'):
             # Task selection button
@@ -1531,7 +1585,7 @@ class TaskService:
             task_id = message.replace('mark_complete_', '')
             self.mark_task_complete(member, phone_number, task_id, language)
         except Exception as e:
-            print(f"❌ Error handling mark complete from selection: {e}")
+            logger.error(f" Error handling mark complete from selection: {e}")
             error_msg = "Unable to mark task as complete. Please try again."
             self.whatsapp_service.send_message(phone_number, error_msg, language)
 
@@ -1548,7 +1602,7 @@ class TaskService:
         requires_photo = task.get('requires_photo', 0) == 1
         allows_inventory_update = task.get('allows_inventory_update', 0) == 1
 
-        print(f"🔍 Task check - requires_photo: {requires_photo}, allows_inventory_update: {allows_inventory_update}")
+        logger.debug(f" Task check - requires_photo: {requires_photo}, allows_inventory_update: {allows_inventory_update}")
         
         # Get clean phone number
         clean_phone = phone_number.replace('whatsapp:', '')
@@ -1774,8 +1828,8 @@ class TaskService:
             #     "📸 Photo received! Processing...", 
             #     language
             # )
-            print(f"🖼️ Processing image upload from {phone_number}")
-            print(f"📎 Media ID: {media_id}")
+            logger.info(f" Processing image upload from {phone_number}")
+            logger.debug(f" Media ID: {media_id}")
             
             # Check user context to understand the flow
             clean_phone = phone_number.replace('whatsapp:', '')
@@ -1785,18 +1839,18 @@ class TaskService:
                 # Try with original format
                 user_context = self._get_user_context(phone_number)
             
-            print(f"🔍 Current user context: {user_context}")
+            logger.debug(f" Current user context: {user_context}")
             
             # FIRST: Check if this is a photo+inventory flow
             if user_context and 'completion_flow' in user_context:
                 task_id = user_context.get('pending_completion_task')
                 flow_type = user_context['completion_flow']
                 
-                print(f"🔍 Flow type: {flow_type}, Task ID: {task_id}")
+                logger.debug(f" Flow type: {flow_type}, Task ID: {task_id}")
                 
                 if flow_type == 'photo_and_inventory':
                     # Process the photo first
-                    print(f"📸 Processing photo for photo+inventory flow")
+                    logger.info(f" Processing photo for photo+inventory flow")
                     image_path = self.image_service.download_meta_media(
                         media_id, 
                         task_id, 
@@ -1820,7 +1874,7 @@ class TaskService:
                     if not uploaded_filename:
                         uploaded_filename = os.path.basename(image_path)
                     
-                    print(f"✅ Photo uploaded: {uploaded_filename}")
+                    logger.info(f" Photo uploaded: {uploaded_filename}")
                     
                     # Get inventory items for this task BEFORE asking for updates
                     inventory_items = self.get_inventory_for_task(task_id)
@@ -1854,7 +1908,7 @@ class TaskService:
                         inventory_msg += f"(Or specify item: `2 5`)\n\n"
                         inventory_msg += f"Or send 'skip' to complete without inventory updates."
                         
-                        print(f"📦 Asking for inventory updates for {len(inventory_items)} items")
+                        logger.info(f" Asking for inventory updates for {len(inventory_items)} items")
                         
                         # Send the inventory update message
                         self.whatsapp_service.send_message(phone_number, inventory_msg, language)
@@ -1863,7 +1917,7 @@ class TaskService:
                     else:
                         # Task has allows_inventory_update but no items linked yet
                         # Ask user if they want to skip inventory or the task needs inventory items to be linked
-                        print(f"📦 No inventory items linked to task {task_id}, but task allows inventory update")
+                        logger.info(f" No inventory items linked to task {task_id}, but task allows inventory update")
                         
                         # Store context so user can skip or we can handle their response
                         new_context = {
@@ -1901,18 +1955,18 @@ class TaskService:
                     
                 elif flow_type == 'inventory_only':
                     # This shouldn't happen for image uploads
-                    print(f"⚠️ Unexpected: Image upload in inventory_only flow")
+                    logger.warning(f" Unexpected: Image upload in inventory_only flow")
                     # Fall through to default handling
             
             # SECOND: Check if this is a simple photo task
             if user_context and 'pending_photo_task' in user_context:
                 task_id = user_context['pending_photo_task']
-                print(f"📸 Processing simple photo task {task_id}")
+                logger.info(f" Processing simple photo task {task_id}")
                 
                 # Check if this task also needs inventory
                 task = self.task_model.get_task_by_id(task_id, member['id'])
                 if task and task.get('allows_inventory_update', 0) == 1:
-                    print(f"📦 Task {task_id} needs both photo and inventory, switching flow")
+                    logger.info(f" Task {task_id} needs both photo and inventory, switching flow")
                     # This task needs both photo AND inventory, switch to photo+inventory flow
                     clean_phone = phone_number.replace('whatsapp:', '')
                     context_data = {
@@ -1925,20 +1979,18 @@ class TaskService:
                     self.handle_image_upload(member, phone_number, media_id, language)
                     return
                 else:
-                    print(f"📸 Task {task_id} is photo-only, processing directly")
+                    logger.info(f" Task {task_id} is photo-only, processing directly")
                     # Simple photo-only task
                     self._clear_user_context(phone_number)
                     self._process_task_photo(member, phone_number, task_id, media_id, language)
                     return
             
             # THIRD: Default fallback - process as simple photo
-            print(f"📸 No specific context, using default photo processing")
+            logger.info(f" No specific context, using default photo processing")
             self._process_task_photo_direct(member, phone_number, media_id, language)
                 
         except Exception as e:
-            print(f"❌ Error in image upload: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error in image upload: {e}")
             error_msg = self.whatsapp_service._get_translated_message('upload_error', language)
             self.whatsapp_service.send_message(phone_number, error_msg, language)
 
@@ -1957,7 +2009,7 @@ class TaskService:
             self.whatsapp_service.send_message(phone_number, download_error_msg, language)
             return
 
-        print(f"✅ Image downloaded: {image_path}")
+        logger.info(f" Image downloaded: {image_path}")
         
         # Upload to backend API
         client_id = member.get('client_id')
@@ -2010,7 +2062,7 @@ class TaskService:
         full_task = self.task_model.get_task_by_id(task_id, member['id'])
         allows_inventory = full_task.get('allows_inventory_update', 0) == 1 if full_task else task.get('allows_inventory_update', 0) == 1
         
-        print(f"📸 _process_task_photo_direct: task_id={task_id}, allows_inventory={allows_inventory}")
+        logger.info(f" _process_task_photo_direct: task_id={task_id}, allows_inventory={allows_inventory}")
         
         # Check if this task needs inventory
         if allows_inventory:
@@ -2022,7 +2074,7 @@ class TaskService:
             }
             self._store_user_context(clean_phone, context_data)
             self._store_user_context(phone_number, context_data)
-            print(f"📦 Task {task_id} needs both photo and inventory, switching to combined flow")
+            logger.info(f" Task {task_id} needs both photo and inventory, switching to combined flow")
             # Recursively process with the context now set
             self.handle_image_upload(member, phone_number, media_id, language)
         else:
@@ -2031,7 +2083,7 @@ class TaskService:
 
     def handle_text_message(self, member, phone_number, message, language):
         """Handle text messages that might be inventory updates"""
-        print(f"🔍 Checking text message for inventory update from {phone_number}: '{message}'")
+        logger.debug(f" Checking text message for inventory update from {phone_number}: '{message}'")
         
         # Get the cleaned phone number (without whatsapp: prefix)
         clean_phone = phone_number.replace('whatsapp:', '')
@@ -2040,11 +2092,11 @@ class TaskService:
         user_context = self._get_user_context(clean_phone)
         
         if not user_context:
-            print(f"🔍 No user context found for {clean_phone}")
+            logger.debug(f" No user context found for {clean_phone}")
             # Also try with whatsapp: prefix
             user_context = self._get_user_context(f"whatsapp:{clean_phone}")
             if not user_context:
-                print(f"🔍 No user context found for whatsapp:{clean_phone} either")
+                logger.debug(f" No user context found for whatsapp:{clean_phone} either")
                 
                 # FALLBACK: Check if message looks like inventory update format (e.g., "6" or "1 6")
                 # and user has pending inventory tasks
@@ -2055,17 +2107,17 @@ class TaskService:
                         float(qty)  # Validate it's a number
                         
                         # Message looks like inventory update - try to recover context
-                        print(f"🔍 Message '{message}' looks like inventory update, attempting recovery")
+                        logger.debug(f" Message '{message}' looks like inventory update, attempting recovery")
                         return self._handle_inventory_recovery(member, phone_number, message, language)
                     except (ValueError, TypeError):
                         pass
                 
                 return False
             else:
-                print(f"🔍 Found context with whatsapp: prefix format")
+                logger.debug(f" Found context with whatsapp: prefix format")
         
         # DEBUG: Show what context was found
-        print(f"🔍 DEBUG: user_context found = {user_context}")
+        logger.debug(f" DEBUG: user_context found = {user_context}")
         
         # Check if user is searching for inventory (typed a keyword)
         if user_context.get('inventory_search'):
@@ -2132,7 +2184,7 @@ class TaskService:
                 props = user_context.get('properties', [])
                 if 1 <= selection <= len(props):
                     selected_prop = props[selection - 1]
-                    print(f"📦 User selected property #{selection}: {selected_prop['name']} (ID: {selected_prop['id']})")
+                    logger.info(f" User selected property #{selection}: {selected_prop['name']} (ID: {selected_prop['id']})")
                     self._clear_user_context(phone_number)
                     self.handle_property_inventory_selection(member, phone_number, str(selected_prop['id']), language)
                     return True
@@ -2156,42 +2208,42 @@ class TaskService:
                 try:
                     qty = parts[-1]
                     float(qty)
-                    print(f"🔍 Context has wrong flow ({completion_flow}), but message looks like inventory update. Attempting recovery.")
+                    logger.debug(f" Context has wrong flow ({completion_flow}), but message looks like inventory update. Attempting recovery.")
                     return self._handle_inventory_recovery(member, phone_number, message, language)
                 except (ValueError, TypeError):
                     pass
-            print(f"🔍 Context has completion_flow='{completion_flow}', not an inventory flow")
+            logger.debug(f" Context has completion_flow='{completion_flow}', not an inventory flow")
             return False
         
         if completion_flow == 'photo_and_inventory' and not user_context.get('photo_uploaded'):
-            print(f"🔍 Photo not yet uploaded for photo_and_inventory flow")
+            logger.debug(f" Photo not yet uploaded for photo_and_inventory flow")
             return False
         
         task_id = user_context.get('pending_completion_task')
         inventory_items = user_context.get('inventory_items', [])
         
-        print(f"🔍 Inventory flow: task_id={task_id}, items={len(inventory_items) if inventory_items else 0}")
+        logger.debug(f" Inventory flow: task_id={task_id}, items={len(inventory_items) if inventory_items else 0}")
         
         if not task_id:
-            print(f"🔍 No task_id in context")
+            logger.debug(f" No task_id in context")
             return False
             
         if not inventory_items:
-            print(f"🔍 No inventory items in context, attempting to recover from database")
+            logger.debug(f" No inventory items in context, attempting to recover from database")
             # Try to recover inventory items from database
             inventory_items = self.get_inventory_for_task(task_id)
             if inventory_items:
-                print(f"🔍 Recovered {len(inventory_items)} inventory items from database")
+                logger.debug(f" Recovered {len(inventory_items)} inventory items from database")
                 # Update context with recovered items
                 user_context['inventory_items'] = inventory_items
                 self._store_user_context(clean_phone, user_context)
                 self._store_user_context(f"whatsapp:{clean_phone}", user_context)
             else:
-                print(f"🔍 No inventory items found in database either")
+                logger.debug(f" No inventory items found in database either")
                 # Still handle 'skip' even if no items
                 message_lower = message.strip().lower()
                 if message_lower == 'skip':
-                    print(f"🔍 User wants to skip (no items)")
+                    logger.debug(f" User wants to skip (no items)")
                     success = self.task_model.update_task_status(task_id, 'completed', member['id'])
                     if success and user_context.get('photo_filename'):
                         # Also add photo if we have one
@@ -2215,7 +2267,7 @@ class TaskService:
         
         # Check if user wants to skip
         if message_lower == 'skip':
-            print(f"🔍 User wants to skip inventory update")
+            logger.debug(f" User wants to skip inventory update")
             # Complete the task without inventory updates
             success = self.task_model.update_task_status(task_id, 'completed', member['id'])
             if success and user_context.get('photo_filename'):
@@ -2238,7 +2290,7 @@ class TaskService:
         try:
             # Remove any extra whitespace and split
             parts = message.strip().split()
-            print(f"🔍 Parsing message parts: {parts}")
+            logger.debug(f" Parsing message parts: {parts}")
             
             if len(parts) == 1:
                 item_index = 0
@@ -2247,7 +2299,7 @@ class TaskService:
                 item_index = int(parts[0]) - 1
                 new_quantity = parts[1]
             else:
-                print(f"🔍 Invalid format: expected 1 or 2 parts, got {len(parts)}")
+                logger.debug(f" Invalid format: expected 1 or 2 parts, got {len(parts)}")
                 # Show error with format reminder
                 error_msg = f"Invalid format. Please use: `new_quantity` (or specify item: `1 10`)\nExample: `10`\n\nCurrent items:\n"
                 for i, item in enumerate(inventory_items, 1):
@@ -2257,13 +2309,13 @@ class TaskService:
                 
             # Validate item index
             if item_index < 0 or item_index >= len(inventory_items):
-                print(f"🔍 Invalid item index: {item_index + 1}, valid range: 1-{len(inventory_items)}")
+                logger.debug(f" Invalid item index: {item_index + 1}, valid range: 1-{len(inventory_items)}")
                 error_msg = f"Invalid item number. Please choose between 1 and {len(inventory_items)}"
                 self.whatsapp_service.send_message(phone_number, error_msg, language)
                 return True
                 
             item = inventory_items[item_index]
-            print(f"🔍 Updating item: {item['name']} from {item['current_quantity']} to {new_quantity}")
+            logger.debug(f" Updating item: {item['name']} from {item['current_quantity']} to {new_quantity}")
             
             # Update inventory quantity in database
             success = self.update_inventory_quantity(item['id'], new_quantity)
@@ -2284,7 +2336,7 @@ class TaskService:
                 
                 # Check if all items updated
                 if not inventory_items:
-                    print(f"✅ All inventory items updated")
+                    logger.info(f" All inventory items updated")
                     # All inventory updated, complete the task
                     task_success = self.task_model.update_task_status(task_id, 'completed', member['id'])
                     if task_success and user_context.get('photo_filename'):
@@ -2318,25 +2370,23 @@ class TaskService:
                 return True
                     
         except ValueError as e:
-            print(f"❌ Error parsing inventory update (ValueError): {e}")
+            logger.error(f" Error parsing inventory update (ValueError): {e}")
             error_msg = "Invalid format. Please use: `new_quantity`\nExample: `10`"
             self.whatsapp_service.send_message(phone_number, error_msg, language)
             return True
         except Exception as e:
-            print(f"❌ Error parsing inventory update: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error parsing inventory update: {e}")
             error_msg = "Invalid format. Please use: `new_quantity`\nExample: `10`"
             self.whatsapp_service.send_message(phone_number, error_msg, language)
             return True
         
-        print(f"🔍 Not an inventory update message")
+        logger.debug(f" Not an inventory update message")
         return False
 
     def _handle_inventory_recovery(self, member, phone_number, message, language):
         """Handle inventory update when context was lost - try to recover from database state"""
         try:
-            print(f"🔄 Attempting inventory recovery for {phone_number}")
+            logger.info(f" Attempting inventory recovery for {phone_number}")
             
             # Look for tasks that are awaiting completion with inventory update
             # Get tasks that require photo and have a photo uploaded but not completed
@@ -2367,17 +2417,17 @@ class TaskService:
             conn.close()
             
             if not result:
-                print(f"🔍 No pending inventory task found for recovery")
+                logger.debug(f" No pending inventory task found for recovery")
                 return False
             
             task_id = result['task_id']
-            print(f"🔄 Found pending inventory task: {task_id} - {result['title']}")
+            logger.info(f" Found pending inventory task: {task_id} - {result['title']}")
             
             # Get inventory items for this task
             inventory_items = self.get_inventory_for_task(task_id)
             
             if not inventory_items:
-                print(f"🔍 No inventory items for task {task_id}")
+                logger.debug(f" No inventory items for task {task_id}")
                 return False
             
             # Parse the message
@@ -2443,60 +2493,76 @@ class TaskService:
                 return True
                 
         except Exception as e:
-            print(f"❌ Error in inventory recovery: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error in inventory recovery: {e}")
             return False
 
     def _store_user_context(self, phone_number, context_data):
-        """Store temporary user context for button interactions"""
-        # Simple in-memory storage - consider using database for production
+        """Store temporary user context for button interactions with timestamp"""
         if not hasattr(self, '_user_contexts'):
             self._user_contexts = {}
         
-        # Clean the phone number (remove whatsapp: prefix)
-        clean_phone = phone_number.replace('whatsapp:', '')
-        whatsapp_phone = f"whatsapp:{clean_phone}"
+        nphone = normalize_phone(phone_number)
         
-        # Store with ALL formats to ensure we can retrieve it
-        self._user_contexts[clean_phone] = context_data
-        self._user_contexts[whatsapp_phone] = context_data
-        self._user_contexts[phone_number] = context_data  # Also store original in case it differs
+        # Add timestamp for auto-expiry
+        context_data['_context_ts'] = time.time()
         
-        print(f"💾 Stored context for {clean_phone}, {whatsapp_phone}, and {phone_number}")
+        self._user_contexts[nphone] = context_data
+        
+        # Also persist to DB if available
+        if self.bot_session:
+            try:
+                self.bot_session.set_context(nphone, context_data)
+            except Exception:
+                pass
+        
+        logger.debug(f"Stored context for {nphone}")
 
     def _get_user_context(self, phone_number):
-        """Get user context for button interactions"""
+        """Get user context for button interactions, returning None if expired"""
+        nphone = normalize_phone(phone_number)
+        
         if hasattr(self, '_user_contexts'):
-            # Try with the exact phone number first
-            if phone_number in self._user_contexts:
-                return self._user_contexts[phone_number]
+            ctx = self._user_contexts.get(nphone)
             
-            # Try with cleaned version
-            clean_phone = phone_number.replace('whatsapp:', '')
-            if clean_phone in self._user_contexts:
-                return self._user_contexts[clean_phone]
-            
-            # Try with whatsapp: prefix
-            whatsapp_phone = f"whatsapp:{clean_phone}"
-            if whatsapp_phone in self._user_contexts:
-                return self._user_contexts[whatsapp_phone]
+            if ctx:
+                # Check TTL
+                ts = ctx.get('_context_ts', 0)
+                if time.time() - ts > CONTEXT_TTL_SECONDS:
+                    self._clear_user_context(phone_number)
+                    try:
+                        user_lang = self.user_languages.get(nphone, 'en')
+                        timeout_msg = "⏰ Your previous session has expired. Returning to main menu."
+                        self.whatsapp_service.send_message(nphone, timeout_msg, user_lang)
+                    except Exception:
+                        pass
+                    return None
+                return ctx
+        
+        # Fallback to DB
+        if self.bot_session:
+            ctx = self.bot_session.get_context(nphone, CONTEXT_TTL_SECONDS)
+            if ctx:
+                if not hasattr(self, '_user_contexts'):
+                    self._user_contexts = {}
+                self._user_contexts[nphone] = ctx
+                return ctx
         
         return None
 
     def _clear_user_context(self, phone_number):
         """Clear user context"""
+        nphone = normalize_phone(phone_number)
+        
         if hasattr(self, '_user_contexts'):
-            # Clean the phone number
-            clean_phone = phone_number.replace('whatsapp:', '')
-            whatsapp_phone = f"whatsapp:{clean_phone}"
-            
-            # Remove ALL formats
-            self._user_contexts.pop(clean_phone, None)
-            self._user_contexts.pop(whatsapp_phone, None)
-            self._user_contexts.pop(phone_number, None)
-            
-            print(f"🗑️ Cleared context for {clean_phone}")
+            self._user_contexts.pop(nphone, None)
+        
+        if self.bot_session:
+            try:
+                self.bot_session.clear_context(nphone)
+            except Exception:
+                pass
+        
+        logger.debug(f"Cleared context for {nphone}")
 
     def handle_property_inventory_menu(self, member, phone_number, language, force_selection=False):
         """Ask user to type inventory name/details to search"""
@@ -2544,7 +2610,7 @@ class TaskService:
                 conn.close()
                 client_id = row['client_id'] if row else None
             except Exception as e:
-                print(f"❌ Error getting client_id: {e}")
+                logger.error(f" Error getting client_id: {e}")
                 client_id = None
 
         if not client_id:
@@ -2652,7 +2718,7 @@ class TaskService:
             cursor.close()
             conn.close()
         except Exception as e:
-            print(f"❌ Error fetching inventory item: {e}")
+            logger.error(f" Error fetching inventory item: {e}")
             self.whatsapp_service.send_message(phone_number, "❌ Error loading inventory item.", language)
             return
 
@@ -2862,12 +2928,12 @@ class TaskService:
             try:
                 translated = self.language_service.translate_text(search_term, 'en')
                 if translated:
-                    print(f"🌐 Translated search term: '{search_term}' → '{translated}'")
+                    logger.info(f" Translated search term: '{search_term}' → '{translated}'")
                     search_term = translated.strip()
             except Exception as e:
-                print(f"⚠️ Search term translation failed: {e}")
+                logger.warning(f" Search term translation failed: {e}")
 
-        print(f"🔍 Direct search: scope={scope}, term='{search_term}'")
+        logger.debug(f" Direct search: scope={scope}, term='{search_term}'")
 
         if scope == 'task':
             self._search_tasks(member, phone_number, search_term, language)
@@ -3185,15 +3251,13 @@ class TaskService:
                     self.whatsapp_service.send_message(phone_number, msg, language, buttons[:3])
 
         except Exception as e:
-            print(f"❌ Error searching clients: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error searching clients: {e}")
             self.whatsapp_service.send_message(phone_number, "❌ Error searching clients.", language)
 
     def _do_client_switch(self, member, phone_number, client, language):
-        """Switch the active client for a team member (in-memory preference)."""
+        """Switch the active client for a team member (persisted to DB)."""
         try:
-            clean_phone = phone_number.replace('whatsapp:', '')
+            clean_phone = normalize_phone(phone_number)
 
             # Verify the team_members record exists for this phone + client
             target_member = self.team_member_model.find_by_phone_and_client(clean_phone, client['id'])
@@ -3207,16 +3271,16 @@ class TaskService:
                 )
                 return
 
-            # Store the active client preference (keyed by clean phone)
-            self.user_active_client[clean_phone] = client['id']
+            # Persist the active client preference
+            self.set_active_client(clean_phone, client['id'])
 
             # Clear any cached property selections since client changed
             self.user_property_selections.pop(clean_phone, None)
-            self.user_property_selections.pop(phone_number, None)
+            if self.bot_session:
+                self.bot_session.clear_property_selections(clean_phone)
 
             # Clear user context to prevent stale state
             self._clear_user_context(phone_number)
-            self._clear_user_context(clean_phone)
 
             confirmation = (
                 f"✅ *Client Switched*\n\n"
@@ -3232,12 +3296,10 @@ class TaskService:
 
             self.whatsapp_service.send_message(phone_number, confirmation, language, buttons)
 
-            print(f"✅ Client switched to '{client['name']}' (ID: {client['id']}) for phone {clean_phone}")
+            logger.info(f"Client switched to '{client['name']}' (ID: {client['id']}) for phone {clean_phone}")
 
         except Exception as e:
-            print(f"❌ Error switching client: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Error switching client: {e}", exc_info=True)
             self.whatsapp_service.send_message(phone_number, "❌ Failed to switch client. Please try again.", language)
 
     def _switch_property(self, member, phone_number, search_term, language):
@@ -3356,9 +3418,7 @@ class TaskService:
                 self.whatsapp_service.send_message(phone_number, msg, language, buttons[:3])
 
         except Exception as e:
-            print(f"❌ Error showing client selection: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error showing client selection: {e}")
             self.whatsapp_service.send_message(phone_number, "❌ Error loading clients.", language)
 
     def _show_search_help(self, member, phone_number, language):
@@ -3545,16 +3605,14 @@ class TaskService:
             cursor.close()
             conn.close()
             
-            print(f"📦 Found {len(inventory_items)} inventory items for task {task_occurrence_id}")
+            logger.info(f" Found {len(inventory_items)} inventory items for task {task_occurrence_id}")
             for item in inventory_items:
-                print(f"  - {item['name']}: {item['current_quantity']} {item.get('unit', 'units')}")
+                logger.debug(f"  - {item['name']}: {item['current_quantity']} {item.get('unit', 'units')}")
             
             return inventory_items
             
         except Exception as e:
-            print(f"❌ Error getting inventory for task: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error getting inventory for task: {e}")
             return []
 
     def handle_standalone_inventory_update(self, member, phone_number, message, language, user_context):
@@ -3721,9 +3779,7 @@ class TaskService:
                 self.whatsapp_service.send_message(phone_number, error_msg, language)
                 
         except Exception as e:
-            print(f"❌ Error handling skip inventory: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error handling skip inventory: {e}")
             error_msg = "❌ An error occurred. Please try again."
             self.whatsapp_service.send_message(phone_number, error_msg, language)
 
@@ -3742,7 +3798,7 @@ class TaskService:
                 try:
                     quantity_value = int(new_quantity)
                 except ValueError:
-                    print(f"❌ Invalid quantity value: {new_quantity}")
+                    logger.error(f" Invalid quantity value: {new_quantity}")
                     return False
             
             query = "UPDATE inventory SET quantity = %s WHERE id = %s"
@@ -3753,11 +3809,9 @@ class TaskService:
             cursor.close()
             conn.close()
             
-            print(f"✅ Updated inventory ID {inventory_id} to quantity {quantity_value}")
+            logger.info(f" Updated inventory ID {inventory_id} to quantity {quantity_value}")
             return rows_affected > 0
             
         except Exception as e:
-            print(f"❌ Error updating inventory: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f" Error updating inventory: {e}")
             return False

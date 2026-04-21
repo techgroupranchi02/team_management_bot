@@ -16,6 +16,7 @@ class ReminderService:
         self.logger = logging.getLogger(__name__)
         self.is_running = False
         self.reminder_thread = None
+        self.last_heartbeat = 0
 
     def _send_individual_reminder(self, task):
         """Send reminder for an individual recurring task"""
@@ -114,7 +115,7 @@ class ReminderService:
         self.logger.info("❌ Reminder scheduler stopped")
 
     def _run_scheduler(self):
-        """Run the scheduler loop"""
+        """Run the scheduler loop with heartbeat"""
         # Schedule reminders to run every day at 9:00 AM
         schedule.every().day.at("09:00").do(self.send_daily_reminders)
         
@@ -126,6 +127,7 @@ class ReminderService:
         
         while self.is_running:
             try:
+                self.last_heartbeat = time.time()
                 schedule.run_pending()
             except Exception as e:
                 self.logger.error(f"Error in scheduler loop: {e}")

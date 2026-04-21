@@ -1,12 +1,21 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import os
 from dotenv import load_dotenv
 from services.language_service import LanguageService
 import logging
 import json
+import time
 
 
 load_dotenv()
+
+# WhatsApp message limits
+TEXT_CHAR_LIMIT = 65536
+INTERACTIVE_CHAR_LIMIT = 4096
+REQUEST_TIMEOUT = 30  # seconds
+
 
 class WhatsAppService:
     def __init__(self):
@@ -20,6 +29,60 @@ class WhatsAppService:
             
         self.language_service = LanguageService()
         self.logger = logging.getLogger(__name__)
+
+        # Track token health
+        self._last_token_error = 0
+        self._consecutive_auth_failures = 0
+
+        # Session with automatic retries on transient errors
+        self._session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=1,           # 1s, 2s, 4s
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST", "GET"],
+            raise_on_status=False,
+        )
+        self._session.mount("https://", HTTPAdapter(max_retries=retries))
+
+    # ── token health helpers ────────────────────────────────
+    def check_token_health(self):
+        """Lightweight token validity check. Returns True if token appears valid."""
+        try:
+            url = f"https://graph.facebook.com/{self.api_version}/{self.phone_number_id}"
+            resp = self._session.get(
+                url,
+                headers={'Authorization': f'Bearer {self.meta_access_token}'},
+                timeout=10,
+            )
+            if resp.status_code == 401:
+                self.logger.critical("META_ACCESS_TOKEN expired or invalid! Bot will not send messages.")
+                return False
+            return resp.status_code == 200
+        except Exception as e:
+            self.logger.error(f"Token health check failed: {e}")
+            return False
+
+    def _track_api_response(self, response):
+        """Track auth failures to detect token expiry."""
+        if response.status_code == 401:
+            self._consecutive_auth_failures += 1
+            self._last_token_error = time.time()
+            if self._consecutive_auth_failures >= 3:
+                self.logger.critical(
+                    "META_ACCESS_TOKEN appears expired — %d consecutive 401 errors. "
+                    "All messages will fail until the token is refreshed.",
+                    self._consecutive_auth_failures,
+                )
+        else:
+            self._consecutive_auth_failures = 0
+
+    @staticmethod
+    def _truncate_message(text, limit):
+        """Truncate message to stay within WhatsApp character limits."""
+        if not text or len(text) <= limit:
+            return text
+        return text[: limit - 50] + "\n\n... (message truncated)"
 
     def _clean_phone_number_for_meta(self, phone_number):
         """Clean and format phone number for Meta API"""
@@ -158,6 +221,7 @@ class WhatsAppService:
         """Send an interactive list message"""
         try:
             clean_to = self._clean_phone_number_for_meta(to)
+            body_text = self._truncate_message(body_text, INTERACTIVE_CHAR_LIMIT)
             
             if not self._is_valid_phone_number(clean_to):
                 self.logger.error(f"Invalid phone number format: {clean_to}")
@@ -207,13 +271,10 @@ class WhatsAppService:
                 }
             }
             
-            print(f"📋 Sending interactive list with {len(sections)} sections")
-            print(f"📋 Payload: {json.dumps(payload, indent=2)}")
+            self.logger.debug(f"Sending interactive list with {len(sections)} sections")
             
-            response = requests.post(self.graph_api_url, headers=headers, json=payload)
-            
-            print(f"📋 Response Status: {response.status_code}")
-            print(f"📋 Response Body: {response.text[:500]}")
+            response = self._session.post(self.graph_api_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+            self._track_api_response(response)
             
             if response.status_code == 200:
                 self.logger.info("✅ Interactive list sent successfully!")
@@ -224,17 +285,12 @@ class WhatsAppService:
                 
         except Exception as e:
             self.logger.error(f"❌ Error sending interactive list: {str(e)}")
-            import traceback
-            traceback.print_exc()
             return False
 
     def send_message(self, to, message, language='en', buttons=None):
         try:
             # Clean and format phone number for Meta API
             clean_to = self._clean_phone_number_for_meta(to)
-            
-            print(f"📤 Attempting to send to: {clean_to}, Original: {to}")
-            print(f"📤 Message: {message[:50]}...")
             
             if not self._is_valid_phone_number(clean_to):
                 self.logger.error(f"Invalid phone number format: {clean_to}")
@@ -246,6 +302,9 @@ class WhatsAppService:
             }
             
             if buttons:
+                # Truncate body for interactive messages
+                message = self._truncate_message(message, INTERACTIVE_CHAR_LIMIT)
+
                 # Create interactive button message
                 payload = {
                     "messaging_product": "whatsapp",
@@ -263,13 +322,8 @@ class WhatsAppService:
                     }
                 }
                 
-                # Debug: Print the button structure
-                print(f"🔘 Button structure: {json.dumps(payload['interactive'], indent=2)}")
-                
-                response = requests.post(self.graph_api_url, headers=headers, json=payload)
-                
-                print(f"📤 Response Status: {response.status_code}")
-                print(f"📤 Response: {response.text[:200]}")
+                response = self._session.post(self.graph_api_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+                self._track_api_response(response)
                 
                 if response.status_code == 200:
                     response_data = response.json()
@@ -286,6 +340,9 @@ class WhatsAppService:
                     return self._send_fallback_message(clean_to, message, headers, language)
                     
             else:
+                # Truncate for text messages
+                message = self._truncate_message(message, TEXT_CHAR_LIMIT)
+
                 # Regular text message
                 payload = {
                     "messaging_product": "whatsapp",
@@ -298,11 +355,8 @@ class WhatsAppService:
                     }
                 }
                 
-                print(f"📤 Sending text message...")
-                
-                response = requests.post(self.graph_api_url, headers=headers, json=payload)
-                
-                print(f"📤 Response Status: {response.status_code}")
+                response = self._session.post(self.graph_api_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+                self._track_api_response(response)
                 
                 if response.status_code == 200:
                     self.logger.info("✅ Text message sent successfully!")
@@ -313,8 +367,6 @@ class WhatsAppService:
                 
         except Exception as e:
             self.logger.error(f"❌ Error sending WhatsApp message: {str(e)}")
-            import traceback
-            traceback.print_exc()
             return False
 
     def _send_fallback_message(self, clean_to, message, headers, language='en'):
@@ -332,7 +384,7 @@ class WhatsAppService:
                 }
             }
             
-            fallback_response = requests.post(self.graph_api_url, headers=headers, json=fallback_payload)
+            fallback_response = self._session.post(self.graph_api_url, headers=headers, json=fallback_payload, timeout=REQUEST_TIMEOUT)
             
             if fallback_response.status_code == 200:
                 self.logger.info("✅ Fallback text message sent successfully!")

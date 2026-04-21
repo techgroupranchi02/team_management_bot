@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta
 import mysql.connector
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Task:
@@ -8,7 +11,11 @@ class Task:
         self.db_config = db_config
 
     def get_connection(self):
-        return mysql.connector.connect(**self.db_config)
+        try:
+            from models.db_pool import get_pooled_connection
+            return get_pooled_connection()
+        except Exception:
+            return mysql.connector.connect(**self.db_config)
 
     def create_task(
         self,
@@ -75,7 +82,7 @@ class Task:
         cursor = conn.cursor(dictionary=True)
 
         try:
-            # Updated query for new structure
+            # Fetch all pending/in_progress tasks + recently completed/skipped (last 30 days)
             query = """
                 SELECT 
                     tocc.id as task_occurrence_id,
@@ -95,12 +102,17 @@ class Task:
                 LEFT JOIN team_members tm ON tocc.assigned_to = tm.id
                 WHERE tocc.assigned_to = %s
                 AND tocc.status != 'deleted'
+                AND (
+                    tocc.status IN ('pending', 'in_progress')
+                    OR tocc.scheduled_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                )
                 ORDER BY 
                     CASE 
                         WHEN tocc.status IN ('pending', 'in_progress') THEN 0 
                         ELSE 1 
                     END,
                     tocc.scheduled_date DESC
+                LIMIT 50
             """
             cursor.execute(query, (user_id,))
             tasks = cursor.fetchall()
@@ -154,6 +166,9 @@ class Task:
             cursor.close()
             conn.close()
 
+    # Whitelist of allowed columns for dynamic updates
+    ALLOWED_UPDATE_COLUMNS = frozenset({'status', 'completed_at'})
+
     def update_task_status(self, task_id, status, user_id):
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -163,6 +178,11 @@ class Task:
 
             if status == "completed":
                 update_data["completed_at"] = datetime.now()
+
+            # Validate column names against whitelist
+            for key in update_data.keys():
+                if key not in self.ALLOWED_UPDATE_COLUMNS:
+                    raise ValueError(f"Column '{key}' is not allowed for update")
 
             set_clause = ", ".join([f"{key} = %s" for key in update_data.keys()])
             values = list(update_data.values()) + [task_id, user_id]
@@ -414,6 +434,11 @@ class Task:
             cursor.close()
             conn.close()
 
+    @staticmethod
+    def _escape_like(word):
+        """Escape special LIKE pattern characters in user input"""
+        return word.replace('%', '\\%').replace('_', '\\_')
+
     def search_inventory_by_keyword(self, client_id, search_term):
         """Search inventory items across all properties for a client by keyword matching"""
         conn = self.get_connection()
@@ -426,7 +451,7 @@ class Task:
             conditions = []
             params = []
             for word in words:
-                like_pattern = f"%{word}%"
+                like_pattern = f"%{self._escape_like(word)}%"
                 conditions.append(
                     "(i.name LIKE %s OR i.category LIKE %s OR i.located_at LIKE %s OR p.name LIKE %s)"
                 )
@@ -479,7 +504,7 @@ class Task:
             conn.close()
             return True
         except Exception as e:
-            print(f"Error logging task activity: {e}")
+            logger.error(f"Error logging task activity: {e}")
             return False
 
     def add_completion_images_direct(self, task_id, image_filename, user_id):
@@ -517,7 +542,7 @@ class Task:
 
             return True
         except Exception as e:
-            print(f"❌ Error adding completion image directly: {e}")
+            logger.error(f" Error adding completion image directly: {e}")
             return False
         
     def get_recurring_tasks_by_user(self, user_id):
@@ -625,7 +650,7 @@ class Task:
             return tasks_due
             
         except Exception as e:
-            print(f"Error getting recurring tasks for reminder: {e}")
+            logger.error(f"Error getting recurring tasks for reminder: {e}")
             import traceback
             traceback.print_exc()
             return []     
@@ -651,7 +676,7 @@ class Task:
             conn.close()
             return True
         except Exception as e:
-            print(f"Error updating task reminder: {e}")
+            logger.error(f"Error updating task reminder: {e}")
             # If table doesn't exist, just log and return True to avoid breaking
             return True       
 
@@ -665,7 +690,7 @@ class Task:
             params = [user_id]
 
             for word in words:
-                like_pattern = f"%{word}%"
+                like_pattern = f"%{self._escape_like(word)}%"
                 conditions.append(
                     "(td.title LIKE %s OR td.description LIKE %s OR p.name LIKE %s)"
                 )
@@ -723,7 +748,7 @@ class Task:
             params = [client_id]
 
             for word in words:
-                like_pattern = f"%{word}%"
+                like_pattern = f"%{self._escape_like(word)}%"
                 conditions.append("(p.name LIKE %s OR p.address LIKE %s)")
                 params.extend([like_pattern, like_pattern])
 
@@ -834,9 +859,9 @@ class Task:
                 )
             """)
             conn.commit()
-            print("✅ search_history table ensured")
+            logger.info(" search_history table ensured")
         except Exception as e:
-            print(f"⚠️ Error creating search_history table: {e}")
+            logger.warning(f" Error creating search_history table: {e}")
         finally:
             cursor.close()
             conn.close()
@@ -853,7 +878,7 @@ class Task:
             """, (team_member_id, search_term, scope, result_count))
             conn.commit()
         except Exception as e:
-            print(f"⚠️ Error saving search history: {e}")
+            logger.warning(f" Error saving search history: {e}")
         finally:
             cursor.close()
             conn.close()
@@ -875,7 +900,7 @@ class Task:
             cursor.execute(query, (team_member_id, limit))
             return cursor.fetchall()
         except Exception as e:
-            print(f"⚠️ Error getting search history: {e}")
+            logger.warning(f" Error getting search history: {e}")
             return []
         finally:
             cursor.close()

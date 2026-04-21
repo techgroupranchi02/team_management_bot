@@ -1,14 +1,41 @@
 import os
 import requests
 import logging
+import threading
+from collections import OrderedDict
 from typing import Optional
+
+
+class _TranslationCache:
+    """Thread-safe LRU translation cache."""
+    def __init__(self, max_size=5000):
+        self._cache = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    def get(self, key):
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+        return None
+
+    def set(self, key, value):
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = value
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+
 
 class GroqTranslationService:
     def __init__(self):
         self.api_key = os.getenv('GROQ_API_KEY')
         self.api_url = "https://api.groq.com/openai/v1/chat/completions"
-        self.model = "llama-3.1-8b-instant"  # Fast inference model
+        self.model = "llama-3.1-8b-instant"
         self.logger = logging.getLogger(__name__)
+        self._translation_cache = _TranslationCache(max_size=5000)
 
         self.supported_languages = {
             'en': 'English', 'hi': 'Hindi', 'es': 'Spanish', 'fr': 'French',
@@ -71,7 +98,17 @@ class GroqTranslationService:
         return 'en'
 
     def translate_text(self, text: str, target_language: str = 'en', source_language: str = 'auto') -> str:
-        """Translate text to the target language."""
+        """Translate text to the target language (with cache)."""
+        # Skip translation if target is English and looks like English
+        if target_language == 'en':
+            return text
+
+        # Check cache first
+        cache_key = f"{target_language}:{text}"
+        cached = self._translation_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         target_lang_name = self.supported_languages.get(target_language, target_language)
         
         system_prompt = (
@@ -88,6 +125,7 @@ class GroqTranslationService:
         translated_text = self._call_groq_api(system_prompt, text)
 
         if translated_text:
+            self._translation_cache.set(cache_key, translated_text)
             return translated_text
 
         self.logger.warning(f"Failed to translate text: '{text[:20]}...', returning original text.")

@@ -8,6 +8,9 @@ load_dotenv()
 
 
 class ImageService:
+    MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024  # 10MB limit
+    ALLOWED_MIME_TYPES = {'image/jpeg', 'image/png', 'image/webp', 'image/gif'}
+
     def __init__(self):
         self.meta_access_token = os.getenv("META_ACCESS_TOKEN")
         self.api_version = os.getenv("META_API_VERSION", "v19.0")
@@ -37,8 +40,20 @@ class ImageService:
                 print(f"❌ No download URL in response: {media_info}")
                 return None
 
-            # Download the actual media
-            download_response = requests.get(download_url, headers=headers)
+            # Validate MIME type
+            mime_type = media_info.get("mime_type", "image/jpeg")
+            if mime_type not in self.ALLOWED_MIME_TYPES:
+                print(f"❌ Unsupported MIME type: {mime_type}")
+                return None
+
+            # Check file size from metadata if available
+            file_size = media_info.get("file_size")
+            if file_size and int(file_size) > self.MAX_DOWNLOAD_SIZE:
+                print(f"❌ File too large: {file_size} bytes (max {self.MAX_DOWNLOAD_SIZE})")
+                return None
+
+            # Download with streaming and size cap
+            download_response = requests.get(download_url, headers=headers, stream=True)
 
             if download_response.status_code != 200:
                 print(
@@ -46,8 +61,18 @@ class ImageService:
                 )
                 return None
 
+            # Read with size limit
+            chunks = []
+            total_size = 0
+            for chunk in download_response.iter_content(chunk_size=8192):
+                total_size += len(chunk)
+                if total_size > self.MAX_DOWNLOAD_SIZE:
+                    print(f"❌ Download exceeded size limit ({self.MAX_DOWNLOAD_SIZE} bytes)")
+                    return None
+                chunks.append(chunk)
+            content = b"".join(chunks)
+
             # Determine file extension
-            mime_type = media_info.get("mime_type", "image/jpeg")
             extension = mimetypes.guess_extension(mime_type) or ".jpg"
 
             # Create filename
@@ -59,7 +84,7 @@ class ImageService:
 
             # Save image locally
             with open(filepath, "wb") as f:
-                f.write(download_response.content)
+                f.write(content)
 
             print(f"✅ Image saved: {filepath}")
             return filepath

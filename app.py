@@ -1,10 +1,20 @@
-from enum import member
 from flask import Flask, request, jsonify
 import mysql.connector
 from dotenv import load_dotenv
 import os
 import logging
-import json 
+import json
+import hmac
+import hashlib
+import functools
+import signal
+import time
+import threading
+import queue
+from collections import OrderedDict
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from utils.helpers import normalize_phone
 from services.task_service import TaskService
 from services.reminder_service import ReminderService
 
@@ -16,6 +26,83 @@ app = Flask(__name__)
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Rate limiting
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per minute"],
+    storage_uri="memory://"
+)
+
+# Message deduplication cache (message_id -> timestamp)
+class MessageDeduplicationCache:
+    """Thread-safe LRU cache with TTL for deduplicating webhook messages"""
+    def __init__(self, max_size=10000, ttl_seconds=300):
+        self._cache = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+
+    def is_duplicate(self, message_id):
+        """Returns True if message was already processed (duplicate)"""
+        now = time.time()
+        with self._lock:
+            # Check if exists and not expired
+            if message_id in self._cache:
+                if now - self._cache[message_id] < self._ttl:
+                    return True
+                else:
+                    del self._cache[message_id]
+            # Add to cache
+            self._cache[message_id] = now
+            # Evict oldest if over capacity
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+            return False
+
+processed_messages = MessageDeduplicationCache()
+
+def redact_phone(phone):
+    """Redact phone number for logging, keeping last 4 digits"""
+    if not phone:
+        return '***'
+    phone_str = str(phone)
+    if len(phone_str) > 4:
+        return '***' + phone_str[-4:]
+    return '***'
+
+def verify_webhook_signature(req):
+    """Validate the HMAC-SHA256 signature from Meta using App Secret"""
+    app_secret = os.getenv('META_APP_SECRET')
+    if not app_secret:
+        logger.warning("META_APP_SECRET not configured, skipping signature verification")
+        return True  # Allow if not configured (dev mode)
+    signature = req.headers.get('X-Hub-Signature-256', '')
+    if not signature:
+        return False
+    expected = 'sha256=' + hmac.new(
+        app_secret.encode(),
+        req.data,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+def require_admin_auth(f):
+    """Decorator to protect admin/debug endpoints"""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        # Disable debug endpoints in production
+        if os.getenv('FLASK_ENV') == 'production':
+            return jsonify({"error": "Endpoint disabled in production"}), 403
+        # Check for admin API key
+        admin_key = os.getenv('ADMIN_API_KEY')
+        if admin_key:
+            provided_key = request.headers.get('X-Admin-Key', '')
+            if not hmac.compare_digest(provided_key, admin_key):
+                return jsonify({"error": "Unauthorized"}), 403
+        return f(*args, **kwargs)
+    return decorated
 
 # Database configuration
 DB_CONFIG = {
@@ -39,43 +126,59 @@ def get_db_connection():
         return None
 
 # Initialize services
-task_service = TaskService(DB_CONFIG)
+from models.db_pool import init_pool
+init_pool(DB_CONFIG, pool_size=10)
+from models.bot_session import BotSession
+from models.analytics import Analytics
+bot_session = BotSession(DB_CONFIG)
+analytics = Analytics(DB_CONFIG)
+task_service = TaskService(DB_CONFIG, bot_session=bot_session, analytics=analytics)
 reminder_service = ReminderService(DB_CONFIG)
 
-def check_existing_data():
-    """Check what data already exists in the database"""
-    from models.team_member import TeamMember
-    from models.task import Task
-    
-    team_member_model = TeamMember(DB_CONFIG)
-    task_model = Task(DB_CONFIG)
-    
-    # Check if sample team member exists
-    sample_member = team_member_model.find_by_phone('7667130178')
-    if sample_member:
-        print(f"✅ Team member found: {sample_member['name']} (ID: {sample_member['id']})")
-        
-        # Check tasks for this member
-        tasks = task_model.get_tasks_by_user(sample_member['id'])
-        print(f"📋 Number of tasks assigned: {len(tasks)}")
-        
-        for task in tasks:
-            print(f"  - {task['title']} (Status: {task['status']})")
-    else:
-        print("❌ Team member not found")
+# ── Async message processing queue (8.1) ──────────────────
+_message_queue = queue.Queue(maxsize=500)
+
+def _process_message_worker():
+    """Worker thread that drains the message queue."""
+    while True:
+        try:
+            func, args, kwargs = _message_queue.get(timeout=5)
+        except queue.Empty:
+            # Periodically flush analytics
+            analytics.flush()
+            continue
+        try:
+            func(*args, **kwargs)
+        except Exception:
+            logger.error("Error in async message worker", exc_info=True)
+        finally:
+            _message_queue.task_done()
+
+# Start 2 worker threads (safe because Gunicorn worker is single-process)
+for _i in range(2):
+    _t = threading.Thread(target=_process_message_worker, daemon=True)
+    _t.start()
+
+# Start reminder scheduler at module level (needed for Gunicorn)
+reminder_service.start_reminder_scheduler()
 
 @app.route('/')
 def home():
     return jsonify({"message": "Team Management WhatsApp Bot is running!"})
 
 @app.route('/whatsapp/webhook', methods=['POST'])
+@limiter.limit("60 per minute")
 def whatsapp_webhook():
     try:
+        # Verify webhook signature from Meta
+        if not verify_webhook_signature(request):
+            logger.warning("Invalid webhook signature received")
+            return jsonify({"error": "Invalid signature"}), 403
+
         # Meta sends JSON data, not form data
         data = request.get_json()
         
         if not data or 'entry' not in data:
-            logger.info("No valid message data in webhook")
             return '', 200
         
         # Process each entry
@@ -84,173 +187,163 @@ def whatsapp_webhook():
                 if change.get('field') == 'messages':
                     value = change.get('value', {})
                     
-                    # Check if this is a message or a status update
                     if 'messages' in value:
-                        # This is an actual message from user
                         messages = value.get('messages', [])
                         contacts = value.get('contacts', [])
                         
                         if messages:
                             message = messages[0]
+                            message_id = message.get('id', '')
+                            
+                            if message_id and processed_messages.is_duplicate(message_id):
+                                logger.info(f"Skipping duplicate message: {message_id}")
+                                continue
+                            
                             message_type = message.get('type')
                             from_number = message.get('from', '')
-                            
-                            # Get contact name if available
-                            contact_name = contacts[0].get('profile', {}).get('name', '') if contacts else ''
+                            phone = normalize_phone(from_number)
                             
                             # Get member info
-                            clean_phone = from_number.replace('whatsapp:', '')
-                            member = task_service.team_member_model.find_by_phone(clean_phone)
+                            member = task_service.team_member_model.find_by_phone(phone)
                             
-                            # Check if user has an active client preference (from client switching)
+                            # Check if user has an active client preference
                             if member:
-                                active_cid = task_service.user_active_client.get(clean_phone)
+                                active_cid = task_service.get_active_client(phone)
                                 if active_cid and member.get('client_id') != active_cid:
-                                    switched = task_service.team_member_model.find_by_phone_and_client(clean_phone, active_cid)
+                                    switched = task_service.team_member_model.find_by_phone_and_client(phone, active_cid)
                                     if switched:
                                         member = switched
                             
-                            logger.info(f"📨 Message type: {message_type} from: {from_number} (Contact: {contact_name})")
+                            logger.info(f"Message type: {message_type} from: {redact_phone(from_number)}")
+                            analytics.log_event('message_received', phone, message_type)
                             
+                            # Dispatch to async worker (return 200 immediately)
                             try:
-                                if message_type == 'text':
-                                    incoming_msg = message.get('text', {}).get('body', '').strip()
-                                    logger.info(f"📝 Text message: {incoming_msg}")
-                                    
-                                    if incoming_msg.lower().startswith('join'):
-                                        logger.info(f"Join command received: {incoming_msg}")
-                                    else:
-                                        # Process text message
-                                        task_service.handle_message(f"whatsapp:{from_number}", incoming_msg, None)
-                                
-                                elif message_type == 'image':
-                                    # Get image information
-                                    image_data = message.get('image', {})
-                                    media_id = image_data.get('id', '')
-                                    caption = image_data.get('caption', '')
-                                    
-                                    logger.info(f"🖼️ Image message, Media ID: {media_id}, Caption: {caption}")
-                                    
-                                    # Process image upload with caption (if any)
-                                    task_service.handle_message(f"whatsapp:{from_number}", caption or "", media_id)
-                                
-                                elif message_type == 'audio':
-                                    # Handle voice messages
-                                    audio_data = message.get('audio', {})
-                                    media_id = audio_data.get('id', '')
-                                    
-                                    logger.info(f"🎙️ Voice message, Media ID: {media_id}")
-                                    
-                                    # Process voice message - transcribe and handle
-                                    task_service.handle_voice_message(f"whatsapp:{from_number}", media_id)
-                                
-                                elif message_type == 'interactive':
-                                    # Handle interactive messages
-                                    interactive_data = message.get('interactive', {})
-                                    interactive_type = interactive_data.get('type')
-                                    
-                                    if interactive_type == 'button_reply':
-                                        button_reply = interactive_data.get('button_reply', {})
-                                        if button_reply:
-                                            button_id = button_reply.get('id', '')
-                                            title = button_reply.get('title', '')
-                                            logger.info(f"🔄 Button click: {button_id} - {title}")
-                                            # Send the button title as the message
-                                            task_service.handle_message(f"whatsapp:{from_number}", title, None, button_id=button_id)
-                                    
-                                    elif interactive_type == 'list_reply':
-                                        list_reply = interactive_data.get('list_reply', {})
-                                        if list_reply:
-                                            list_id = list_reply.get('id', '')
-                                            list_title = list_reply.get('title', '')
-                                            list_description = list_reply.get('description', '')
-                                            logger.info(f"📋 List selection: {list_id} - {list_title}")
-                                            
-                                            if member:
-                                                # Handle settings menu selections
-                                                if list_id == "property_info":
-                                                    # Show current property info
-                                                    task_service.show_current_property_info(member, f"whatsapp:{from_number}", 'en')
-                                                elif list_id == "property_change":
-                                                    # Show property selection menu
-                                                    task_service.show_property_selection_menu(member, f"whatsapp:{from_number}", 'en')
-                                                elif list_id == "back_main":
-                                                    # Return to main menu
-                                                    task_service.show_main_menu(member, f"whatsapp:{from_number}", 'en')
-                                                elif list_id == "language_change":
-                                                    # Handle language change
-                                                    task_service.handle_language_change(member, f"whatsapp:{from_number}", 'en')
-                                                elif list_id.startswith('lang_'):
-                                                    # Dynamic language selection - extract code from ID
-                                                    lang_code = list_id.replace('lang_', '')
-                                                    lang_name = list_title  # Use the title from the list selection
-                                                    logger.info(f"🌐 Language selected: {lang_code} - {lang_name}")
-                                                    task_service.save_language_preference(f"whatsapp:{from_number}", lang_code, lang_name)
-                                                elif list_id == "back_settings":
-                                                    # Return to settings
-                                                    task_service.show_settings_menu(member, f"whatsapp:{from_number}", 'en')
-                                                elif list_id == "client_change":
-                                                    # Show client selection menu (from Settings)
-                                                    task_service.show_client_selection_menu(member, f"whatsapp:{from_number}", 'en')
-                                                elif list_id.startswith('switch_client_'):
-                                                    # Client selection from client list
-                                                    client_id = list_id.replace('switch_client_', '')
-                                                    logger.info(f"🏢 Client selected: ID={client_id}, Name={list_title}")
-                                                    user_language = getattr(task_service, '_get_user_language', lambda phone, text: 'en')(f"whatsapp:{from_number}", '')
-                                                    # Lookup client by ID directly (not by name, which can be truncated)
-                                                    try:
-                                                        matched_client = task_service.task_model.get_client_by_id(int(client_id))
-                                                        if not matched_client:
-                                                            matched_client = {'id': int(client_id), 'name': list_title}
-                                                        task_service._do_client_switch(member, f"whatsapp:{from_number}", matched_client, user_language)
-                                                    except Exception as e:
-                                                        logger.error(f"Error switching client: {e}")
-                                                        import traceback
-                                                        traceback.print_exc()
-                                                        task_service.whatsapp_service.send_message(f"whatsapp:{from_number}", "❌ Failed to switch client. Please try again.", 'en')
-                                                elif list_id.startswith('property_'):
-                                                    # Property selection from property list
-                                                    property_id = list_id.replace('property_', '')
-                                                    logger.info(f"🎯 Property selected: ID={property_id}, Name={list_title}")
-                                                    task_service.handle_property_selection_result(f"whatsapp:{from_number}", property_id, list_title)
-                                                elif list_id.startswith('inv_prop_'):
-                                                    property_id = list_id.replace('inv_prop_', '')
-                                                    logger.info(f"📦 Inventory Property selected: ID={property_id}, Name={list_title}")
-                                                    
-                                                    # We need user_language inside app.py... 
-                                                    # Let's just use task_service.handle_property_inventory_selection
-                                                    user_language = getattr(task_service, '_get_user_language', lambda phone, text: 'en')(f"whatsapp:{from_number}", '')
-                                                    task_service.handle_property_inventory_selection(member, f"whatsapp:{from_number}", property_id, user_language)
-                                                else:
-                                                    # Send list title as regular message
-                                                    task_service.handle_message(f"whatsapp:{from_number}", list_title, None)
-                                            else:
-                                                logger.error(f"Member not found for {from_number}")
-                                                # Fallback to regular message handling
-                                                task_service.handle_message(f"whatsapp:{from_number}", list_title, None)
-                                
-                                else:
-                                    logger.info(f"⚠️ Unhandled message type: {message_type}")
-                            
-                            except Exception as e:
-                                # Log error but don't crash - return 200 to Meta
-                                logger.error(f"Error processing message: {e}")
-                                import traceback
-                                traceback.print_exc()
-                                return '', 200  # IMPORTANT: Return 200 even on error
-                    
-                    elif 'statuses' in value:
-                        # This is a status update for a message we sent (ignore to reduce logs)
-                        pass
+                                _dispatch_message(message, message_type, from_number, phone, member, contacts)
+                            except queue.Full:
+                                logger.error("Message queue full, dropping message")
         
         return '', 200
 
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        import traceback
-        traceback.print_exc()
-        # Still return 200 to Meta to prevent retries
+        logger.error(f"Error processing webhook: {e}", exc_info=True)
         return '', 200
+
+
+def _dispatch_message(message, message_type, from_number, phone, member, contacts):
+    """Parse message and push work item to async queue."""
+    if message_type == 'text':
+        incoming_msg = message.get('text', {}).get('body', '').strip()
+        if not incoming_msg:
+            return
+        if incoming_msg.lower().startswith('join'):
+            logger.info(f"Join command received: {incoming_msg}")
+            return
+        _message_queue.put_nowait((
+            task_service.handle_message,
+            (f"whatsapp:{from_number}", incoming_msg, None),
+            {},
+        ))
+
+    elif message_type == 'image':
+        image_data = message.get('image', {})
+        media_id = image_data.get('id', '')
+        caption = image_data.get('caption', '')
+        _message_queue.put_nowait((
+            task_service.handle_message,
+            (f"whatsapp:{from_number}", caption or "", media_id),
+            {},
+        ))
+
+    elif message_type == 'audio':
+        audio_data = message.get('audio', {})
+        media_id = audio_data.get('id', '')
+        _message_queue.put_nowait((
+            task_service.handle_voice_message,
+            (f"whatsapp:{from_number}", media_id),
+            {},
+        ))
+
+    elif message_type == 'interactive':
+        interactive_data = message.get('interactive', {})
+        interactive_type = interactive_data.get('type')
+
+        if interactive_type == 'button_reply':
+            button_reply = interactive_data.get('button_reply', {})
+            if button_reply:
+                button_id = button_reply.get('id', '')
+                title = button_reply.get('title', '')
+                logger.info(f"Button click: {button_id} - {title}")
+                _message_queue.put_nowait((
+                    task_service.handle_message,
+                    (f"whatsapp:{from_number}", title, None),
+                    {"button_id": button_id},
+                ))
+
+        elif interactive_type == 'list_reply':
+            list_reply = interactive_data.get('list_reply', {})
+            if list_reply:
+                _message_queue.put_nowait((
+                    _handle_list_reply,
+                    (list_reply, from_number, member),
+                    {},
+                ))
+    else:
+        # Unsupported message type
+        try:
+            unsupported_msg = "📎 I can only process text, images, and voice messages. Please send your request in one of these formats."
+            task_service.whatsapp_service.send_message(
+                f"whatsapp:{from_number}", unsupported_msg, 'en'
+            )
+        except Exception:
+            pass
+
+
+def _handle_list_reply(list_reply, from_number, member):
+    """Handle interactive list replies (runs in worker thread)."""
+    list_id = list_reply.get('id', '')
+    list_title = list_reply.get('title', '')
+    logger.info(f"List selection: {list_id} - {list_title}")
+
+    if member:
+        if list_id == "property_info":
+            task_service.show_current_property_info(member, f"whatsapp:{from_number}", 'en')
+        elif list_id == "property_change":
+            task_service.show_property_selection_menu(member, f"whatsapp:{from_number}", 'en')
+        elif list_id == "back_main":
+            task_service.show_main_menu(member, f"whatsapp:{from_number}", 'en')
+        elif list_id == "language_change":
+            task_service.handle_language_change(member, f"whatsapp:{from_number}", 'en')
+        elif list_id.startswith('lang_'):
+            lang_code = list_id.replace('lang_', '')
+            lang_name = list_title
+            task_service.save_language_preference(f"whatsapp:{from_number}", lang_code, lang_name)
+        elif list_id == "back_settings":
+            task_service.show_settings_menu(member, f"whatsapp:{from_number}", 'en')
+        elif list_id == "client_change":
+            task_service.show_client_selection_menu(member, f"whatsapp:{from_number}", 'en')
+        elif list_id.startswith('switch_client_'):
+            client_id = list_id.replace('switch_client_', '')
+            user_language = task_service._get_user_language(f"whatsapp:{from_number}", '')
+            try:
+                matched_client = task_service.task_model.get_client_by_id(int(client_id))
+                if not matched_client:
+                    matched_client = {'id': int(client_id), 'name': list_title}
+                task_service._do_client_switch(member, f"whatsapp:{from_number}", matched_client, user_language)
+            except Exception as e:
+                logger.error(f"Error switching client: {e}", exc_info=True)
+                task_service.whatsapp_service.send_message(f"whatsapp:{from_number}", "❌ Failed to switch client. Please try again.", 'en')
+        elif list_id.startswith('property_'):
+            property_id = list_id.replace('property_', '')
+            task_service.handle_property_selection_result(f"whatsapp:{from_number}", property_id, list_title)
+        elif list_id.startswith('inv_prop_'):
+            property_id = list_id.replace('inv_prop_', '')
+            user_language = task_service._get_user_language(f"whatsapp:{from_number}", '')
+            task_service.handle_property_inventory_selection(member, f"whatsapp:{from_number}", property_id, user_language)
+        else:
+            task_service.handle_message(f"whatsapp:{from_number}", list_title, None)
+    else:
+        task_service.handle_message(f"whatsapp:{from_number}", list_title, None)
     
 @app.route('/whatsapp/webhook', methods=['GET'])
 def verify_webhook():
@@ -272,20 +365,22 @@ def verify_webhook():
         return jsonify({"error": "Verification failed"}), 403
 
 @app.route('/debug', methods=['GET'])
+@require_admin_auth
 def debug_info():
-    """Debug endpoint to check application status"""
-    from models.team_member import TeamMember
-    team_member_model = TeamMember(DB_CONFIG)
-    
-    member = team_member_model.find_by_phone('7667130178')
-    
+    """Debug endpoint to check application status (protected)"""
+    conn = get_db_connection()
+    db_ok = bool(conn)
+    if conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
     return jsonify({
         "status": "running",
-        "member_exists": bool(member),
-        "member_details": member if member else None,
-        "database_connected": bool(get_db_connection())
+        "database_connected": db_ok
     })
 @app.route('/send-test-reminder/<int:task_id>', methods=['POST'])
+@require_admin_auth
 def send_test_reminder(task_id):
     """Endpoint to test reminder for a specific task"""
     try:
@@ -298,6 +393,7 @@ def send_test_reminder(task_id):
         return jsonify({"status": "error", "message": str(e)}), 500    
 
 @app.route('/test-whatsapp/<phone_number>', methods=['POST'])
+@require_admin_auth
 def test_whatsapp(phone_number):
     """Test endpoint to send a WhatsApp message"""
     try:
@@ -323,13 +419,88 @@ def test_whatsapp(phone_number):
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# ── Health check (7.1) ─────────────────────────────────────
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Comprehensive health endpoint for monitoring."""
+    import psutil, os as _os
+    checks = {}
+
+    # DB connectivity
+    conn = get_db_connection()
+    checks['database'] = bool(conn)
+    if conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # Meta token health
+    try:
+        checks['meta_token'] = task_service.whatsapp_service.check_token_health()
+    except Exception:
+        checks['meta_token'] = False
+
+    # Reminder scheduler alive
+    try:
+        thread_alive = (
+            reminder_service.reminder_thread is not None
+            and reminder_service.reminder_thread.is_alive()
+        )
+        checks['reminder_scheduler'] = thread_alive
+        # Auto-restart if dead
+        if reminder_service.is_running and not thread_alive:
+            logger.warning("Reminder scheduler thread died — restarting")
+            reminder_service.is_running = False
+            reminder_service.start_reminder_scheduler()
+            checks['reminder_scheduler_restarted'] = True
+    except Exception:
+        checks['reminder_scheduler'] = False
+
+    # Process stats
+    proc = psutil.Process(_os.getpid())
+    checks['memory_mb'] = round(proc.memory_info().rss / 1024 / 1024, 1)
+    checks['uptime_seconds'] = round(time.time() - _app_start_time)
+    checks['message_queue_size'] = _message_queue.qsize()
+
+    healthy = checks['database'] and checks.get('meta_token', False)
+    status_code = 200 if healthy else 503
+
+    return jsonify({"healthy": healthy, "checks": checks}), status_code
+
+_app_start_time = time.time()
+
+
+# ── Admin notification helper (8.4) ────────────────────────
+def _notify_admins(message):
+    """Send a WhatsApp alert to admin numbers on critical errors."""
+    admin_phones = os.getenv('ADMIN_PHONE_NUMBERS', '').split(',')
+    for phone in admin_phones:
+        phone = phone.strip()
+        if phone:
+            try:
+                task_service.whatsapp_service.send_message(phone, message, 'en')
+            except Exception:
+                logger.error(f"Failed to notify admin {phone}")
+
+
+# ── Graceful shutdown (7.4) ────────────────────────────────
+def _graceful_shutdown(signum, frame):
+    logger.info("Received signal %s — shutting down gracefully", signum)
+    reminder_service.stop_reminder_scheduler()
+    analytics.flush()
+    from models.db_pool import _pool
+    if _pool:
+        logger.info("Closing connection pool")
+    logger.info("Shutdown complete")
+
+signal.signal(signal.SIGTERM, _graceful_shutdown)
+signal.signal(signal.SIGINT, _graceful_shutdown)
+
+
 if __name__ == '__main__':
-    # Check existing data instead of creating sample data
-    print("🔍 Checking existing data...")
-    check_existing_data()
-    
     # Start the reminder scheduler
-    print("🔔 Starting reminder scheduler...")
+    logger.info("Starting reminder scheduler...")
     reminder_service.start_reminder_scheduler()
     
     # Run the application
@@ -337,7 +508,8 @@ if __name__ == '__main__':
     logger.info(f"Starting Flask app on port {port}")
     
     try:
-        app.run(host='0.0.0.0', port=port, debug=True)
+        app.run(host='0.0.0.0', port=port, debug=os.getenv('FLASK_ENV') == 'development')
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
+        logger.info("Shutting down...")
         reminder_service.stop_reminder_scheduler()
+        analytics.flush()

@@ -1,7 +1,9 @@
 Flask
-pymongo
+flask-limiter
 python-dotenv
-twilio
 requests
 pytz
-langdetect
+psutil
+schedule
+mysql-connector-python
+groq
