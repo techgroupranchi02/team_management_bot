@@ -11,7 +11,9 @@ pipeline {
         VPS_SSH_KEY_ID  = 'vps-root-ssh-key'
         PROJECT         = 'team-management-bot'
     }
-
+    triggers {
+        githubPush()
+    }
     options {
         timeout(time: 10, unit: 'MINUTES')
         disableConcurrentBuilds()
